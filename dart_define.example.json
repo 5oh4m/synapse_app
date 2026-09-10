@@ -1,0 +1,7 @@
+{
+  "BACKEND": "memory",
+  "API_BASE": "http://localhost:8787",
+  "AI": "mock",
+  "ANTHROPIC_API_KEY": "",
+  "ANTHROPIC_MODEL": "claude-sonnet-5"
+}
