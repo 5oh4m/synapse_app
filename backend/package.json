@@ -1,0 +1,14 @@
+{
+  "name": "quizzle-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Reference Node backend for quizzle live sessions (spec section 6 alternative).",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node src/server.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
