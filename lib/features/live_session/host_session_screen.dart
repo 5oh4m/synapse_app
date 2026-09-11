@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
+import '../../core/env.dart';
 import '../../core/responsive.dart';
 import '../../models/enums.dart';
 import '../../models/question.dart';
@@ -80,6 +81,8 @@ class _Lobby extends ConsumerWidget {
             textAlign: TextAlign.center,
             style: t.textTheme.titleLarge,
           ),
+          const SizedBox(height: 16),
+          if (!Env.isRemote) const _MemoryModeNotice(),
           const SizedBox(height: 16),
           Card(
             child: Padding(
@@ -173,6 +176,40 @@ class _Lobby extends ConsumerWidget {
                   ),
               ],
             ),
+        ],
+      ),
+    );
+  }
+}
+
+/// The default `BACKEND=memory` mode keeps every quiz in this browser tab's /
+/// app instance's own memory. A join code shown here only resolves in another
+/// tab, window or device once the app is switched to the Node backend.
+class _MemoryModeNotice extends StatelessWidget {
+  const _MemoryModeNotice();
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: scheme.tertiaryContainer,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(Icons.info_outline, size: 18, color: scheme.onTertiaryContainer),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              'Offline demo mode: this code only works in tabs/windows opened '
+              'from this same running app. For real multi-device play, start '
+              'backend/ and run with BACKEND=remote (see README).',
+              style: TextStyle(color: scheme.onTertiaryContainer, fontSize: 12.5),
+            ),
+          ),
         ],
       ),
     );
