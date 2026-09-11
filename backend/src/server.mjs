@@ -725,6 +725,7 @@ const server = http.createServer((req, res) => {
   if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
 
   const url = new URL(req.url, 'http://x');
+  if (process.env.LOG !== '0') console.log(req.method, url.pathname);
   if (url.pathname === '/' || url.pathname === '/health') return ok(res, { ok: true, ai: AI });
   const urlParts = url.pathname.split('/').filter(Boolean);
 
