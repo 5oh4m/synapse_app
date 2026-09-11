@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:dio/dio.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../../core/env.dart';
@@ -70,6 +71,7 @@ class RemoteBackend implements Backend {
 
   @override
   Future<void> init() async {
+    await _auth.restoreSession();
     _connectWs();
   }
 
@@ -222,6 +224,8 @@ class RemoteBackend implements Backend {
 
 class _RemoteAuth implements AuthRepository {
   _RemoteAuth(this._b);
+  static const _tokenPrefKey = 'quizzle.remote.token';
+
   final RemoteBackend _b;
   final _ctrl = StreamController<AppUser?>.broadcast();
   AppUser? _current;
@@ -235,10 +239,51 @@ class _RemoteAuth implements AuthRepository {
   @override
   AppUser? get currentUser => _current;
 
+  /// The server keeps quizzes/content/scores regardless (it's the one thing
+  /// that already survives a page reload with this backend); this restores
+  /// just the client-side "who am I" so the person isn't dropped back to the
+  /// sign-in screen on every reload too.
+  Future<void> restoreSession() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final token = prefs.getString(_tokenPrefKey);
+      if (token == null) return;
+      _b._token = token;
+      final r = await _b._get('/auth/me');
+      _current = AppUser.fromJson(r['user'] as Map<String, dynamic>);
+      _ctrl.add(_current);
+    } catch (_) {
+      // Expired/invalid token (or server restarted without persistence) —
+      // fall back to the sign-in screen instead of getting stuck.
+      _b._token = null;
+      await _forgetToken();
+    }
+  }
+
+  Future<void> _rememberToken(String? token) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (token == null) {
+        await prefs.remove(_tokenPrefKey);
+      } else {
+        await prefs.setString(_tokenPrefKey, token);
+      }
+    } catch (_) {
+      // Not remembered next time, but the current session still works.
+    }
+  }
+
+  Future<void> _forgetToken() => _rememberToken(null);
+
   void _set(AppUser? u, [String? token]) {
     _current = u;
     _b._token = token ?? _b._token;
-    if (u == null) _b._token = null;
+    if (u == null) {
+      _b._token = null;
+      unawaited(_forgetToken());
+    } else if (token != null) {
+      unawaited(_rememberToken(token));
+    }
     _ctrl.add(u);
   }
 

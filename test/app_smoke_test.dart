@@ -4,8 +4,16 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:quizzle/app/app.dart';
 import 'package:quizzle/data/in_memory/in_memory_backend.dart';
 import 'package:quizzle/state/providers.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
+  setUp(() {
+    // InMemoryBackend and ThemeModeController both read/write
+    // shared_preferences; the mock store keeps that fast and offline in
+    // tests instead of hitting a (nonexistent) platform channel.
+    SharedPreferences.setMockInitialValues({});
+  });
+
   testWidgets('app boots to the sign-in screen', (tester) async {
     final backend = InMemoryBackend();
     await tester.pumpWidget(

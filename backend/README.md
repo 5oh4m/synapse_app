@@ -2,8 +2,11 @@
 
 Node reference server for real multi-device live sessions. Implements the same
 logic as the Flutter `InMemoryBackend`, exposed over REST + one WebSocket for
-live updates. State is in memory — restart clears it. This is the concrete
-starting point for the spec's "custom Node.js backend" option (Section 6).
+live updates. State lives in memory but is mirrored to `data.json` on every
+change and reloaded at boot, so accounts, quizzes and scores survive an
+`npm start` restart (delete `data.json` to reset to empty). This is the
+concrete starting point for the spec's "custom Node.js backend" option
+(Section 6).
 
 ## Run
 
@@ -38,7 +41,7 @@ is validated against the spec Section 7 schema before it is returned.
 
 ## Endpoints
 
-`GET /health` · auth `POST /auth/{register,login,logout}` `PUT /auth/profile` ·
+`GET /health` · auth `POST /auth/{register,login,logout}` `GET /auth/me` `PUT /auth/profile` ·
 content `GET|POST /content` `GET|DELETE /content/:id` ·
 quizzes `GET|POST /quizzes` `GET /quizzes/published` `GET|PUT|DELETE /quizzes/:id`
 `GET|POST /quizzes/:id/questions` `POST /quizzes/:id/questions/reorder`
