@@ -1,0 +1,9 @@
+# The app itself is behind a sign-in and renders to canvas, so there is nothing
+# for a crawler to index there. Allow the root so link unfurlers can read the
+# Open Graph tags in index.html.
+User-agent: *
+Allow: /$
+Disallow: /host/
+Disallow: /play/
+Disallow: /results/
+Disallow: /analytics/
