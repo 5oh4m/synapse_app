@@ -37,4 +37,33 @@ void main() {
     expect(find.textContaining('Hi,'), findsOneWidget);
     expect(find.text('New quiz'), findsWidgets);
   });
+
+  testWidgets('dark mode switch on the profile screen flips the theme',
+      (tester) async {
+    final backend = InMemoryBackend();
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [backendProvider.overrideWithValue(backend)],
+        child: const QuizzleApp(),
+      ),
+    );
+    await tester.pumpAndSettle(const Duration(seconds: 1));
+
+    await tester.tap(find.widgetWithText(OutlinedButton, 'Educator'));
+    await tester.pumpAndSettle(const Duration(seconds: 1));
+
+    await tester.tap(find.byIcon(Icons.account_circle_outlined));
+    await tester.pumpAndSettle(const Duration(seconds: 1));
+
+    expect(find.text('Dark mode'), findsOneWidget);
+    final switchFinder = find.byType(Switch);
+    expect(switchFinder, findsOneWidget);
+
+    final before = Theme.of(tester.element(find.text('Dark mode'))).brightness;
+    await tester.tap(switchFinder);
+    await tester.pumpAndSettle(const Duration(seconds: 1));
+    final after = Theme.of(tester.element(find.text('Dark mode'))).brightness;
+
+    expect(after, isNot(before));
+  });
 }

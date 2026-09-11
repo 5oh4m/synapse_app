@@ -7,6 +7,7 @@ import '../../core/responsive.dart';
 import '../../models/enums.dart';
 import '../../state/controllers.dart';
 import '../../state/providers.dart';
+import '../../state/theme_controller.dart';
 import '../../shared_widgets/async_view.dart';
 
 class ProfileScreen extends ConsumerWidget {
@@ -54,6 +55,21 @@ class ProfileScreen extends ConsumerWidget {
                     ),
                   ),
                   const SizedBox(height: 24),
+                  Card(
+                    child: SwitchListTile(
+                      secondary: Icon(
+                        t.brightness == Brightness.dark
+                            ? Icons.dark_mode_outlined
+                            : Icons.light_mode_outlined,
+                      ),
+                      title: const Text('Dark mode'),
+                      subtitle: const Text('Switch between light and dark theme'),
+                      value: t.brightness == Brightness.dark,
+                      onChanged: (dark) =>
+                          ref.read(themeModeControllerProvider.notifier).setDark(dark),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
                   Card(
                     child: Column(
                       children: [
