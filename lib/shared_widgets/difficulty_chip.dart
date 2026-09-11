@@ -1,36 +1,37 @@
 import 'package:flutter/material.dart';
 
+import '../app/theme.dart';
 import '../models/enums.dart';
+import 'labels.dart';
 
+/// Difficulty as a filled pill with white type.
+///
+/// The previous version tinted the background at 14% and coloured the text,
+/// which put ~3:1 text on a light ground. A solid semantic fill with white
+/// type is 6.7:1 or better on all three levels, in both themes.
 class DifficultyChip extends StatelessWidget {
   const DifficultyChip(this.difficulty, {super.key, this.dense = false});
+
   final Difficulty difficulty;
+
+  /// Tighter padding for use inside a list row.
   final bool dense;
 
   @override
   Widget build(BuildContext context) {
-    final (color, label) = switch (difficulty) {
-      Difficulty.easy => (const Color(0xFF1F9E5B), 'Easy'),
-      Difficulty.medium => (const Color(0xFFF2A100), 'Medium'),
-      Difficulty.hard => (const Color(0xFFE8412E), 'Hard'),
+    final t = QuizzleTokens.of(context);
+    final (Color fill, String label) = switch (difficulty) {
+      Difficulty.easy => (t.correct, 'Easy'),
+      Difficulty.medium => (t.warn, 'Medium'),
+      Difficulty.hard => (t.wrong, 'Hard'),
     };
-    return Container(
-      padding: EdgeInsets.symmetric(
-        horizontal: dense ? 8 : 10,
-        vertical: dense ? 2 : 4,
-      ),
-      decoration: BoxDecoration(
-        color: color.withValues(alpha: 0.14),
-        borderRadius: BorderRadius.circular(20),
-      ),
-      child: Text(
-        label,
-        style: TextStyle(
-          color: color,
-          fontWeight: FontWeight.w700,
-          fontSize: dense ? 11 : 12,
-        ),
-      ),
+
+    return BauhausChip(
+      label: label,
+      fill: fill,
+      ink: t.onAnswer,
+      dense: dense,
+      semanticLabel: '$label difficulty',
     );
   }
 }
