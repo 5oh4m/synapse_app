@@ -50,3 +50,6 @@ app.*.map.json
 *.env.local
 backend/node_modules/
 backend/.env
+
+# machine-local Claude Code permissions
+.claude/settings.local.json
