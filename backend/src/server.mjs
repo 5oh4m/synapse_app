@@ -45,10 +45,71 @@ const joinCode = (n = 6) =>
   Array.from({ length: n }, () =>
     JOIN_ALPHABET[crypto.randomInt(JOIN_ALPHABET.length)]).join('');
 
+// --- persistence -----------------------------------------------------
+// Everything is written to one JSON file on disk, so a registered account,
+// its quizzes and scores survive an `npm start` restart, not just a browser
+// reload (which already survives, since the store lives on this server, not
+// the client). Not a substitute for a real database at scale — see
+// backend/README.md — but a big step up from pure in-memory.
+const DATA_FILE = path.join(__dirname, '..', 'data.json');
+
+function serializeDb() {
+  return {
+    users: [...db.users.values()],
+    passwords: Object.fromEntries(db.passwords),
+    tokens: Object.fromEntries(db.tokens),
+    content: [...db.content.values()],
+    quizzes: [...db.quizzes.values()],
+    questions: [...db.questions.values()],
+    sessions: [...db.sessions.values()],
+    sessionQuestions: Object.fromEntries(db.sessionQuestions),
+    participants: [...db.participants.values()],
+    responses: [...db.responses.values()],
+    cumulative: [...db.cumulative.values()],
+  };
+}
+
+function loadDb() {
+  if (!fs.existsSync(DATA_FILE)) return false;
+  try {
+    const raw = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    for (const u of raw.users || []) db.users.set(u.id, u);
+    for (const [k, v] of Object.entries(raw.passwords || {})) db.passwords.set(k, v);
+    for (const [k, v] of Object.entries(raw.tokens || {})) db.tokens.set(k, v);
+    for (const c of raw.content || []) db.content.set(c.id, c);
+    for (const q of raw.quizzes || []) db.quizzes.set(q.id, q);
+    for (const q of raw.questions || []) db.questions.set(q.id, q);
+    for (const s of raw.sessions || []) db.sessions.set(s.id, s);
+    for (const [k, v] of Object.entries(raw.sessionQuestions || {})) {
+      db.sessionQuestions.set(k, v);
+    }
+    for (const p of raw.participants || []) db.participants.set(p.id, p);
+    for (const r of raw.responses || []) db.responses.set(r.id, r);
+    for (const c of raw.cumulative || []) db.cumulative.set(c.studentId, c);
+    return true;
+  } catch (e) {
+    console.error(`Could not read ${DATA_FILE}, starting empty:`, e.message);
+    return false;
+  }
+}
+
+let persistTimer = null;
+function schedulePersist() {
+  clearTimeout(persistTimer);
+  persistTimer = setTimeout(() => {
+    try {
+      fs.writeFileSync(DATA_FILE, JSON.stringify(serializeDb()));
+    } catch (e) {
+      console.error('Could not persist data.json:', e.message);
+    }
+  }, 300);
+}
+
 // --- websocket bus -----------------------------------------------------
 const wss = new WebSocketServer({ noServer: true });
 const sockets = new Set();
 function broadcast(channel) {
+  schedulePersist();
   const msg = JSON.stringify({ channel });
   for (const ws of sockets) {
     if (ws.readyState === ws.OPEN) ws.send(msg);
@@ -340,6 +401,7 @@ on('POST', '/auth/register', (req, res, p, body) => {
   db.passwords.set(email, body.password);
   const token = uid();
   db.tokens.set(token, u.id);
+  schedulePersist();
   ok(res, { token, user: userJson(u) });
 });
 on('POST', '/auth/login', (req, res, p, body) => {
@@ -348,13 +410,23 @@ on('POST', '/auth/login', (req, res, p, body) => {
   const u = [...db.users.values()].find((x) => x.email === email);
   const token = uid();
   db.tokens.set(token, u.id);
+  schedulePersist();
   ok(res, { token, user: userJson(u) });
 });
-on('POST', '/auth/logout', (req, res) => ok(res, {}));
+on('POST', '/auth/logout', (req, res) => {
+  const token = (req.headers.authorization || '').replace('Bearer ', '');
+  if (db.tokens.delete(token)) schedulePersist();
+  ok(res, {});
+});
+on('GET', '/auth/me', (req, res) => {
+  const u = currentUser(req);
+  return u ? ok(res, { user: userJson(u) }) : err(res, 'Not signed in.', 401);
+});
 on('PUT', '/auth/profile', (req, res, p, body) => {
   const u = currentUser(req);
   if (!u) return err(res, 'Not signed in.', 401);
   if (body.name) u.name = String(body.name);
+  schedulePersist();
   ok(res, { user: userJson(u) });
 });
 function currentUser(req) {
@@ -773,6 +845,11 @@ setInterval(() => {
   }
 }, 1000);
 
+const restored = loadDb();
+
 server.listen(PORT, () => {
-  console.log(`quizzle backend on http://localhost:${PORT}  (AI=${AI})`);
+  console.log(
+    `quizzle backend on http://localhost:${PORT}  (AI=${AI})` +
+      (restored ? `  [restored ${db.users.size} account(s) from data.json]` : ''),
+  );
 });

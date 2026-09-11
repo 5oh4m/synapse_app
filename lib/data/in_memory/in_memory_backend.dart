@@ -1,4 +1,7 @@
 import 'dart:async';
+import 'dart:convert';
+
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../core/failure.dart';
 import '../../core/ids.dart';
@@ -50,7 +53,13 @@ class InMemoryBackend implements Backend {
   AnalyticsRepository get analytics => _analytics;
 
   @override
-  Future<void> init() async => _db.seedDemo();
+  Future<void> init() async {
+    final restored = await _db.tryRestore();
+    if (!restored) {
+      _db.seedDemo();
+      await _db.persistNow();
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -80,9 +89,146 @@ class _Db {
   void setUser(AppUser? u) {
     currentUser = u;
     _authCtrl.add(u);
+    schedulePersist();
   }
 
-  void ping(String channel) => _bus.add(channel);
+  void ping(String channel) {
+    _bus.add(channel);
+    schedulePersist();
+  }
+
+  // -------------------------------------------------------------------
+  // Persistence: every registered account, uploaded quiz and score survives
+  // a page reload / app restart. Stored as one JSON blob via
+  // shared_preferences (localStorage on web, a local file elsewhere) — this
+  // is a dev/demo backend, not a substitute for a real database, but it means
+  // "register, then come back later" actually works.
+  // -------------------------------------------------------------------
+  static const _storeKey = 'quizzle.store.v1';
+  Timer? _persistTimer;
+
+  /// Debounced so a burst of pings (e.g. answers landing during a live
+  /// question) doesn't write on every single one.
+  void schedulePersist() {
+    _persistTimer?.cancel();
+    _persistTimer = Timer(const Duration(milliseconds: 300), persistNow);
+  }
+
+  Future<void> persistNow() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_storeKey, jsonEncode(_snapshot()));
+    } catch (_) {
+      // Storage unavailable (private browsing, disabled cookies, ...) — the
+      // app still works for the current session, it just won't be
+      // remembered next time.
+    }
+  }
+
+  /// Returns true if a previous session was found and restored.
+  Future<bool> tryRestore() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_storeKey);
+      if (raw == null) return false;
+      _hydrate(jsonDecode(raw) as Map<String, dynamic>);
+      seeded = true;
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Map<String, dynamic> _snapshot() => {
+        'users': users.values.map((u) => u.toJson()).toList(),
+        'passwords': passwords,
+        'current_user_id': currentUser?.id,
+        'content': content.values.map((c) => c.toJson()).toList(),
+        'quizzes': quizzes.values.map((q) => q.toJson()).toList(),
+        'questions': questions.values.map((q) => q.toJson()).toList(),
+        'sessions': sessions.values.map((s) => s.toJson()).toList(),
+        'session_questions': sessionQuestionsStore.map(
+          (id, qs) => MapEntry(id, qs.map((q) => q.toJson()).toList()),
+        ),
+        'participants': participants.values.map((p) => p.toJson()).toList(),
+        'responses': responses.values.map((r) => r.toJson()).toList(),
+        'cumulative': cumulative.values
+            .map((c) => {
+                  'student_id': c.studentId,
+                  'name': c.name,
+                  'points': c.points,
+                  'quizzes': c.quizzes,
+                  'correct': c.correct,
+                  'answered': c.answered,
+                })
+            .toList(),
+      };
+
+  /// Set by [_Sessions] so a restore can rebuild its question-list cache too;
+  /// avoids a circular dependency between the two classes.
+  final Map<String, List<Question>> sessionQuestionsStore = {};
+
+  void _hydrate(Map<String, dynamic> j) {
+    users.clear();
+    for (final raw in (j['users'] as List? ?? const [])) {
+      final u = AppUser.fromJson(raw as Map<String, dynamic>);
+      users[u.id] = u;
+    }
+    passwords
+      ..clear()
+      ..addAll((j['passwords'] as Map? ?? const {}).map(
+        (k, v) => MapEntry(k as String, v as String),
+      ));
+    final currentId = j['current_user_id'] as String?;
+    currentUser = currentId == null ? null : users[currentId];
+
+    content.clear();
+    for (final raw in (j['content'] as List? ?? const [])) {
+      final c = ContentItem.fromJson(raw as Map<String, dynamic>);
+      content[c.id] = c;
+    }
+    quizzes.clear();
+    for (final raw in (j['quizzes'] as List? ?? const [])) {
+      final q = Quiz.fromJson(raw as Map<String, dynamic>);
+      quizzes[q.id] = q;
+    }
+    questions.clear();
+    for (final raw in (j['questions'] as List? ?? const [])) {
+      final q = Question.fromJson(raw as Map<String, dynamic>);
+      questions[q.id] = q;
+    }
+    sessions.clear();
+    for (final raw in (j['sessions'] as List? ?? const [])) {
+      final s = QuizSession.fromJson(raw as Map<String, dynamic>);
+      sessions[s.id] = s;
+    }
+    sessionQuestionsStore.clear();
+    (j['session_questions'] as Map? ?? const {}).forEach((id, list) {
+      sessionQuestionsStore[id as String] = (list as List)
+          .map((raw) => Question.fromJson(raw as Map<String, dynamic>))
+          .toList();
+    });
+    participants.clear();
+    for (final raw in (j['participants'] as List? ?? const [])) {
+      final p = SessionParticipant.fromJson(raw as Map<String, dynamic>);
+      participants[p.id] = p;
+    }
+    responses.clear();
+    for (final raw in (j['responses'] as List? ?? const [])) {
+      final r = QuizResponse.fromJson(raw as Map<String, dynamic>);
+      responses[r.id] = r;
+    }
+    cumulative.clear();
+    for (final raw in (j['cumulative'] as List? ?? const [])) {
+      final m = raw as Map<String, dynamic>;
+      cumulative[m['student_id'] as String] =
+          _Cum(m['student_id'] as String, m['name'] as String)
+            ..points = (m['points'] ?? 0) as int
+            ..quizzes = (m['quizzes'] ?? 0) as int
+            ..correct = (m['correct'] ?? 0) as int
+            ..answered = (m['answered'] ?? 0) as int;
+    }
+  }
 
   /// Emits [snapshot()] now, then again on every ping whose channel starts with
   /// one of [channels].
@@ -613,7 +759,9 @@ class _Sessions implements SessionRepository {
   _Sessions(this._db);
   final _Db _db;
 
-  final Map<String, List<Question>> _sessionQuestions = {};
+  /// Backed by [_Db.sessionQuestionsStore] so it round-trips through the same
+  /// persistence snapshot as everything else.
+  Map<String, List<Question>> get _sessionQuestions => _db.sessionQuestionsStore;
 
   List<SessionParticipant> _participants(String sessionId) {
     final l = _db.participants.values

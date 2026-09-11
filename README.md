@@ -22,9 +22,17 @@ use **Continue as Educator / Student** for one-tap demo logins, or register real
 local accounts. A demo quiz ("The Cell — Quick Check") is seeded so you can host
 a live session immediately.
 
+Every account, quiz, question and score is saved to local storage (browser
+`localStorage` on web, a local file elsewhere) and is restored automatically —
+reloading the page or restarting the app brings back who was signed in and
+everything they created, with no re-login required. Sign out to clear the saved
+session; each browser/device keeps its own store.
+
 > In `memory` mode the host and students must be in the **same running app
-> instance** (e.g. one desktop window) because state lives in one process. For a
-> real multi-device live session, run the bundled backend — see below.
+> instance** (e.g. one desktop window) because live state lives in one process.
+> Everything *else* (accounts, quizzes, scores) is saved locally per the above —
+> it's specifically the in-progress live session that needs the same process.
+> For a real multi-device live session, run the bundled backend — see below.
 
 ## Real multi-device live sessions (Node backend)
 
@@ -44,6 +52,12 @@ Now open the app on several devices on the same network (point `API_BASE` at the
 host machine's LAN IP for phones). One person hosts, everyone else joins with the
 code. Live updates arrive over a single WebSocket. This server is also the
 starting point for the "custom backend" option in the spec (Section 6).
+
+The server writes everything to `backend/data.json`, so accounts and quizzes
+survive an `npm start` restart too, not just a page reload (which already
+worked, since this backend's data lives on the server, not the browser tab).
+The client remembers its login token locally, so a reload doesn't force a
+re-login either. Delete `data.json` to reset the server to empty.
 
 ## Real AI question generation
 
@@ -141,6 +155,8 @@ was assumed.
 flutter test
 ```
 
-Covers scoring maths, AI-output schema validation, and an end-to-end live
-session (join → host advance → answer → reveal → score → leaderboard, including
-answer-key protection and double-submit safety).
+Covers scoring maths, AI-output schema validation, an end-to-end live session
+(join → host advance → answer → reveal → score → leaderboard, including
+answer-key protection and double-submit safety), app boot/navigation/dark mode,
+and that a registered account plus everything it created survives a simulated
+restart.
