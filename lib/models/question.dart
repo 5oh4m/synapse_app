@@ -59,6 +59,36 @@ class Question {
     timeLimitSeconds: timeLimitSeconds ?? this.timeLimitSeconds,
   );
 
+  /// Same content, different identity.
+  ///
+  /// Used when a regenerated question has to take over an existing row: the id
+  /// and `order_index` of the row being replaced are preserved, so "Regenerate"
+  /// replaces instead of appending a second question at the same index.
+  Question withId(String id, {String? quizId, int? orderIndex}) => Question(
+    id: id,
+    quizId: quizId ?? this.quizId,
+    text: text,
+    options: options,
+    correctIndex: correctIndex,
+    explanation: explanation,
+    difficulty: difficulty,
+    sourceReference: sourceReference,
+    orderIndex: orderIndex ?? this.orderIndex,
+    timeLimitSeconds: timeLimitSeconds,
+  );
+
+  /// Wire shape for a write. `id` is omitted: the server assigns ids, and a
+  /// client-chosen id was how the duplicate-question bug got in.
+  Map<String, dynamic> toPayload() => {
+    'question_text': text,
+    'options': options,
+    'correct_index': correctIndex,
+    'explanation': explanation,
+    'difficulty': difficulty.name,
+    'source_reference': sourceReference,
+    'time_limit_seconds': timeLimitSeconds,
+  };
+
   Map<String, dynamic> toJson() => {
     'id': id,
     'quiz_id': quizId,

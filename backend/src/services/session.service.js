@@ -22,7 +22,10 @@ import {
   distribution,
   scoreboard,
   listSessionQuestions,
+  answersForQuestion,
+  isRevealed,
 } from './session.queries.js';
+import { answerResultJson } from '../util/serialize.js';
 import * as hub from '../realtime/hub.js';
 
 // Visually unambiguous alphabet: no I/O/0/1.
@@ -136,12 +139,9 @@ export async function joinSession({ joinCode, user }) {
       [session.id, user.sub],
     );
     if (existing.rows[0]) {
-      // Idempotent rejoin: flip connected, keep the score.
-      const { rows: upd } = await client.query(
-        'UPDATE session_participants SET connected = true WHERE id = $1 RETURNING *',
-        [existing.rows[0].id],
-      );
-      return { session, participant: upd[0], created: false };
+      // Idempotent rejoin: keep the score. Presence is the socket's business
+      // (realtime/hub.js), not this request's.
+      return { session, participant: existing.rows[0], created: false };
     }
     if (session.status !== 'lobby' && !session.allow_late_join) {
       throw conflict('This session has already started.');
@@ -154,8 +154,10 @@ export async function joinSession({ joinCode, user }) {
     return { session, participant: ins[0], created: true };
   });
 
+  // Only a new player is news. A re-join used to push the full scoreboard to
+  // every device in the room, so a lobby of flaky phones was a steady stream of
+  // roster frames. The joining device already has its own row from the response.
   if (result.created) hub.emitParticipantJoined(result.session.id, result.participant);
-  hub.emitScoreboard(result.session.id, await scoreboard(result.session.id));
   return result;
 }
 
@@ -184,6 +186,7 @@ async function advanceTo(client, session, index) {
         SET status = 'active',
             current_question_index = $2,
             phase = 'asking',
+            revealed_at = NULL,
             question_started_at = now(),
             question_ends_at = now() + make_interval(secs => $3::int),
             started_at = COALESCE(started_at, now())
@@ -230,7 +233,7 @@ export async function revealCurrent(sessionId, { reason = 'host' } = {}) {
     await zeroFillMissing(client, s);
 
     const { rows: upd } = await client.query(
-      `UPDATE quiz_sessions SET phase = 'revealing' WHERE id = $1 RETURNING ${SESSION_COLS}`,
+      `UPDATE quiz_sessions SET phase = 'revealing', revealed_at = now() WHERE id = $1 RETURNING ${SESSION_COLS}`,
       [sessionId],
     );
     return { session: upd[0], changed: true };
@@ -254,6 +257,11 @@ async function publishReveal(session, reason) {
       distribution: await distribution(session.id, session.current_question_index),
       reason,
     });
+    // Each player's own outcome, to that player's sockets only. The answer
+    // route no longer returns correctness, so this is where it arrives.
+    const rows = await answersForQuestion(session.id, session.current_question_index);
+    const byUser = new Map(rows.map((r) => [r.user_id, answerResultJson(r)]));
+    hub.emitToEachUser(session.id, 'answer.result', (userId) => byUser.get(userId) ?? null);
   }
   hub.emitScoreboard(session.id, await scoreboard(session.id));
 }
@@ -305,7 +313,7 @@ export async function nextQuestion(sessionId) {
     );
     const s = rows[0];
     if (!s) throw notFound('Session not found.');
-    if (s.status === 'ended') throw conflict('This session has already ended.');
+    if (s.status === 'ended') return { session: s, ended: true };
     if (s.status === 'lobby') throw conflict('Start the session first.');
 
     // Anybody who never answered the question we are leaving scores 0 for it.
@@ -331,7 +339,7 @@ async function endInTransaction(client, session) {
   if (session.status === 'active') await zeroFillMissing(client, session);
   const { rows } = await client.query(
     `UPDATE quiz_sessions
-        SET status = 'ended', phase = 'revealing', ended_at = now()
+        SET status = 'ended', phase = 'revealing', revealed_at = NULL, ended_at = now()
       WHERE id = $1 RETURNING ${SESSION_COLS}`,
     [session.id],
   );
@@ -508,6 +516,28 @@ export async function tickAutoReveal() {
       }
     }
   }
+  await tickAutoAdvance();
+  return due.length;
+}
+
+export async function tickAutoAdvance() {
+  const due = await many(
+    `SELECT id FROM quiz_sessions
+      WHERE status = 'active' AND phase = 'revealing'
+        AND revealed_at IS NOT NULL
+        AND revealed_at + make_interval(secs => $1::float) <= now()
+      LIMIT 50`,
+    [config.autoAdvanceSeconds || 5],
+  );
+  for (const row of due) {
+    try {
+      await nextQuestion(row.id);
+    } catch (err) {
+      if (err.code !== 'CONFLICT' && err.code !== 'NOT_FOUND') {
+        log.warn('auto-advance failed', { session_id: row.id, message: err.message });
+      }
+    }
+  }
   return due.length;
 }
 
@@ -527,7 +557,9 @@ export async function sessionResults({ sessionId, participantId }) {
       [participantId],
     );
     const byIndex = new Map(rows.map((r) => [r.question_index, r]));
-    breakdown = questions.map((q) => {
+    // Only questions the class has already seen answered. This endpoint used to
+    // return correct_index and the explanation for every question, mid-quiz.
+    breakdown = questions.filter((q) => isRevealed(session, q.order_index)).map((q) => {
       const r = byIndex.get(q.order_index) || null;
       return {
         question_index: q.order_index,

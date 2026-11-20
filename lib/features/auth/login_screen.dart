@@ -1,13 +1,22 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../app/motion.dart';
+import '../../app/theme.dart';
 import '../../core/failure.dart';
-import '../../core/responsive.dart';
 import '../../models/enums.dart';
+import '../../shared_widgets/async_view.dart';
+import '../../shared_widgets/bauhaus_button.dart';
+import '../../shared_widgets/bauhaus_card.dart';
+import '../../shared_widgets/labels.dart';
 import '../../state/controllers.dart';
 import '../../state/providers.dart';
-import '../../shared_widgets/async_view.dart';
 
+/// Sign in / register.
+///
+/// Bauhaus composition: a single geometric mark, a heavy display title, and a
+/// flat form plane. Everything staggers in 40ms apart on first build; nothing
+/// rests at opacity 0.
 class LoginScreen extends ConsumerStatefulWidget {
   const LoginScreen({super.key});
 
@@ -57,6 +66,8 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
       await ref.read(authControllerProvider.notifier).demoAs(role);
     } on AppFailure catch (e) {
       if (mounted) showSnack(context, e.message, error: true);
+    } catch (e) {
+      if (mounted) showSnack(context, '$e', error: true);
     }
   }
 
@@ -64,40 +75,55 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
   Widget build(BuildContext context) {
     final busy = ref.watch(authControllerProvider);
     final generator = ref.watch(generatorLabelProvider);
-    final t = Theme.of(context);
+    final theme = Theme.of(context);
+    final t = QuizzleTokens.of(context);
+    final gutter = t.gutterFor(MediaQuery.sizeOf(context).width);
 
     return Scaffold(
-      body: Center(
-        child: SingleChildScrollView(
-          child: ContentContainer(
-            maxWidth: 440,
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Icon(Icons.bolt, color: t.colorScheme.primary, size: 34),
-                    const SizedBox(width: 8),
-                    Text(
-                      'quizzle',
-                      style: t.textTheme.headlineMedium?.copyWith(
-                        fontWeight: FontWeight.w800,
+      body: SafeArea(
+        child: Center(
+          child: SingleChildScrollView(
+            padding: EdgeInsets.symmetric(horizontal: gutter, vertical: 28),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 460),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: staggered([
+                  // The one geometric accent on this screen.
+                  Row(
+                    children: [
+                      const _BrandMark(size: 44),
+                      const SizedBox(width: 14),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const EyebrowLabel('AI live quizzes'),
+                            const SizedBox(height: 4),
+                            Semantics(
+                              header: true,
+                              child: Text(
+                                'quizzle',
+                                style: theme.textTheme.displayMedium,
+                              ),
+                            ),
+                          ],
+                        ),
                       ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 6),
-                Text(
-                  'Turn any lecture material into a live quiz.',
-                  textAlign: TextAlign.center,
-                  style: t.textTheme.bodyMedium?.copyWith(
-                    color: t.colorScheme.outline,
+                    ],
                   ),
-                ),
-                const SizedBox(height: 28),
-                Card(
-                  child: Padding(
+                  const SizedBox(height: 12),
+                  ConstrainedBox(
+                    constraints: BoxConstraints(maxWidth: t.proseMaxWidth),
+                    child: Text(
+                      'Turn any lecture material into a live quiz your class '
+                      'can play in the room.',
+                      style: theme.textTheme.bodyLarge,
+                    ),
+                  ),
+                  const SizedBox(height: 24),
+                  BauhausCard(
                     padding: const EdgeInsets.all(20),
                     child: Form(
                       key: _form,
@@ -116,10 +142,11 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
                               ),
                             ],
                             selected: {_register},
+                            showSelectedIcon: false,
                             onSelectionChanged: (s) =>
                                 setState(() => _register = s.first),
                           ),
-                          const SizedBox(height: 16),
+                          const SizedBox(height: 18),
                           if (_register) ...[
                             TextFormField(
                               controller: _name,
@@ -128,8 +155,11 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
                                 labelText: 'Name',
                                 prefixIcon: Icon(Icons.person_outline),
                               ),
+                              validator: (v) => (v == null || v.trim().isEmpty)
+                                  ? 'Tell us your name'
+                                  : null,
                             ),
-                            const SizedBox(height: 12),
+                            const SizedBox(height: 14),
                           ],
                           TextFormField(
                             controller: _email,
@@ -144,7 +174,7 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
                                 ? 'Enter a valid email'
                                 : null,
                           ),
-                          const SizedBox(height: 12),
+                          const SizedBox(height: 14),
                           TextFormField(
                             controller: _password,
                             obscureText: true,
@@ -159,8 +189,8 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
                                 : null,
                           ),
                           if (_register) ...[
-                            const SizedBox(height: 16),
-                            Text('I am a…', style: t.textTheme.labelLarge),
+                            const SizedBox(height: 18),
+                            const EyebrowLabel('I am a'),
                             const SizedBox(height: 8),
                             SegmentedButton<UserRole>(
                               segments: const [
@@ -176,69 +206,143 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
                                 ),
                               ],
                               selected: {_role},
+                              showSelectedIcon: false,
                               onSelectionChanged: (s) =>
                                   setState(() => _role = s.first),
                             ),
                           ],
-                          const SizedBox(height: 20),
-                          FilledButton(
+                          const SizedBox(height: 22),
+                          BauhausButton.primary(
+                            label: _register ? 'Create account' : 'Sign in',
+                            trailingIcon: Icons.arrow_forward,
+                            expand: true,
+                            busy: busy,
                             onPressed: busy ? null : _submit,
-                            child: busy
-                                ? const SizedBox(
-                                    height: 20,
-                                    width: 20,
-                                    child: CircularProgressIndicator(
-                                      strokeWidth: 2,
-                                    ),
-                                  )
-                                : Text(
-                                    _register ? 'Create account' : 'Sign in',
-                                  ),
                           ),
                         ],
                       ),
                     ),
                   ),
-                ),
-                const SizedBox(height: 20),
-                Text(
-                  'Or jump in with a demo account',
-                  textAlign: TextAlign.center,
-                  style: t.textTheme.bodySmall,
-                ),
-                const SizedBox(height: 8),
-                Row(
-                  children: [
-                    Expanded(
-                      child: OutlinedButton.icon(
-                        onPressed: busy ? null : () => _demo(UserRole.educator),
-                        icon: const Icon(Icons.school_outlined),
-                        label: const Text('Educator'),
+                  const SizedBox(height: 24),
+                  const EyebrowLabel('Or jump straight in'),
+                  const SizedBox(height: 10),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: BauhausButton.secondary(
+                          label: 'Educator',
+                          icon: Icons.school_outlined,
+                          semanticLabel: 'Continue as a demo educator',
+                          expand: true,
+                          onPressed: busy
+                              ? null
+                              : () => _demo(UserRole.educator),
+                        ),
                       ),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: OutlinedButton.icon(
-                        onPressed: busy ? null : () => _demo(UserRole.student),
-                        icon: const Icon(Icons.backpack_outlined),
-                        label: const Text('Student'),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: BauhausButton.secondary(
+                          label: 'Student',
+                          icon: Icons.backpack_outlined,
+                          semanticLabel: 'Continue as a demo student',
+                          expand: true,
+                          onPressed: busy ? null : () => _demo(UserRole.student),
+                        ),
                       ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 24),
-                Text(
-                  'Question generation: $generator',
-                  textAlign: TextAlign.center,
-                  style: t.textTheme.bodySmall?.copyWith(
-                    color: t.colorScheme.outline,
+                    ],
                   ),
-                ),
-              ],
+                  const SizedBox(height: 24),
+                  Container(
+                    decoration: t.plane(fill: t.surface),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 14,
+                      vertical: 12,
+                    ),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        ExcludeSemantics(
+                          child: Container(width: 12, height: 12, color: t.warn),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const EyebrowLabel('Question generation'),
+                              const SizedBox(height: 4),
+                              Text(
+                                generator,
+                                // inkSecondary is safe at any size on a
+                                // surface; never on the ice ground.
+                                style: theme.textTheme.bodySmall?.copyWith(
+                                  color: t.inkSecondary,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ]),
+              ),
             ),
           ),
         ),
       ),
     );
   }
+}
+
+/// The brand mark: a filled square with a quarter circle cut into it. One
+/// accent, once, per DESIGN.md.
+class _BrandMark extends StatelessWidget {
+  const _BrandMark({this.size = 44});
+
+  final double size;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = QuizzleTokens.of(context);
+    return ExcludeSemantics(
+      child: SizedBox(
+        width: size,
+        height: size,
+        child: CustomPaint(painter: _BrandPainter(t.ink, t.warn)),
+      ),
+    );
+  }
+}
+
+class _BrandPainter extends CustomPainter {
+  const _BrandPainter(this.ink, this.accent);
+
+  final Color ink;
+  final Color accent;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    canvas.drawRect(
+      Rect.fromLTWH(0, 0, size.width, size.height),
+      Paint()..color = ink,
+    );
+    canvas.drawPath(
+      Path()
+        ..moveTo(size.width, 0)
+        ..arcToPoint(
+          Offset(size.width, size.height),
+          radius: Radius.circular(size.height),
+          clockwise: true,
+        )
+        ..lineTo(size.width, 0)
+        ..close(),
+      Paint()..color = accent,
+    );
+  }
+
+  @override
+  bool shouldRepaint(_BrandPainter old) =>
+      old.ink != ink || old.accent != accent;
 }

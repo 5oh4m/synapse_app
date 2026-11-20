@@ -1,22 +1,54 @@
-import 'dart:async';
-
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
-import '../../core/responsive.dart';
+import '../../app/motion.dart';
+import '../../app/theme.dart';
+import '../../core/failure.dart';
 import '../../models/enums.dart';
+import '../../models/question.dart';
 import '../../models/quiz_session.dart';
 import '../../models/response.dart';
+import '../../models/reveal.dart';
 import '../../models/session_participant.dart';
-import '../../state/providers.dart';
+import '../../shared_widgets/answer_tile.dart';
 import '../../shared_widgets/async_view.dart';
-import '../../shared_widgets/countdown_ring.dart';
+import '../../shared_widgets/bauhaus_button.dart';
+import '../../shared_widgets/countdown_square.dart';
+import '../../shared_widgets/labels.dart';
 import '../../shared_widgets/leaderboard_list.dart';
-import 'option_grid.dart';
+import '../../state/providers.dart';
+import 'connection_banner.dart';
+import 'question_heading.dart';
 
+/// The student's device during a live session. The loud register: one question,
+/// four colour planes, a depleting square and a score that counts.
+///
+/// How it stays correct across devices and bad wifi:
+///
+/// * **Selections are keyed by question index** ([_pending]), so an answer can
+///   never carry over to the next question.
+/// * **The reveal comes from the socket.** The question is fetched once,
+///   redacted. `question.revealed` supplies the key and `answer.result` this
+///   player's outcome. The screen used to refetch the question on the phase
+///   flip and render the stale, redacted copy as revealed for the length of
+///   that request — a RangeError on `options[-1]` on every student's device at
+///   every reveal. A redacted question is now never treated as revealed.
+/// * **Correctness is never taken from the submit response**, which the
+///   server withholds until the reveal.
+/// * **Countdown on the server clock**, so a phone with a drifting clock still
+///   shows the time the server enforces.
+/// * **Presence is the server's job.** The screen no longer posts
+///   `connected: false` from `dispose` — which threw, because `ref` is gone by
+///   then — the socket closing is the signal.
+///
+/// Layout: the question scrolls, Submit is a bar pinned to the bottom edge, so
+/// on a 375 × 667 phone the button is on screen next to four stacked tiles
+/// instead of below the fold. Standings stay mounted between questions (just
+/// hidden), so ranks slide and scores count on from where they were.
 class PlaySessionScreen extends ConsumerStatefulWidget {
   const PlaySessionScreen({super.key, required this.sessionId});
+
   final String sessionId;
 
   @override
@@ -24,7 +56,12 @@ class PlaySessionScreen extends ConsumerStatefulWidget {
 }
 
 class _PlaySessionScreenState extends ConsumerState<PlaySessionScreen> {
-  int? _pendingSelection;
+  /// question index -> tapped-but-not-yet-submitted option.
+  final Map<int, int> _pending = {};
+
+  /// question index -> the receipt for the answer this device submitted.
+  final Map<int, QuizResponse> _submitted = {};
+
   int _submittingForIndex = -1;
   bool _ensuringJoin = false;
 
@@ -35,69 +72,48 @@ class _PlaySessionScreenState extends ConsumerState<PlaySessionScreen> {
   }
 
   Future<void> _ensureJoined() async {
-    if (_ensuringJoin) return;
+    if (_ensuringJoin || !mounted) return;
     _ensuringJoin = true;
     final user = ref.read(currentUserProvider);
     if (user == null) {
-      if (mounted) context.go('/login');
+      GoRouter.maybeOf(context)?.go('/login');
       return;
     }
+    final repo = ref.read(sessionRepositoryProvider);
     try {
-      final repo = ref.read(sessionRepositoryProvider);
       final session = await ref.read(sessionProvider(widget.sessionId).future);
-      if (session == null) return;
+      if (session == null || !mounted) return;
       final joined = ref
           .read(participantsProvider(widget.sessionId))
           .valueOrNull
           ?.any((p) => p.studentId == user.id);
+      // Idempotent and cheap on the server: a re-join no longer broadcasts.
       if (joined != true) {
         await repo.joinSession(joinCode: session.joinCode, student: user);
       }
-      await repo.setConnected(
-        sessionId: widget.sessionId,
-        studentId: user.id,
-        connected: true,
-      );
-    } catch (_) {
-      /* handled by UI states */
+    } on AppFailure {
+      // Surfaced by the connection banner / error views instead.
+    } finally {
+      _ensuringJoin = false;
     }
   }
 
-  @override
-  void dispose() {
+  Future<void> _submit(QuizSession session, int index) async {
+    final selected = _pending[index];
     final user = ref.read(currentUserProvider);
-    if (user != null) {
-      unawaited(
-        ref
-            .read(sessionRepositoryProvider)
-            .setConnected(
-              sessionId: widget.sessionId,
-              studentId: user.id,
-              connected: false,
-            ),
-      );
+    if (selected == null || user == null || _submitted.containsKey(index)) {
+      return;
     }
-    super.dispose();
-  }
-
-  Future<void> _submit(QuizSession s, int index) async {
-    final sel = _pendingSelection;
-    final user = ref.read(currentUserProvider);
-    if (sel == null || user == null) return;
+    final repo = ref.read(sessionRepositoryProvider);
     setState(() => _submittingForIndex = index);
-    final elapsed = s.questionStartedAt == null
-        ? 0
-        : DateTime.now().difference(s.questionStartedAt!).inMilliseconds;
     try {
-      await ref
-          .read(sessionRepositoryProvider)
-          .submitAnswer(
-            sessionId: widget.sessionId,
-            student: user,
-            questionIndex: index,
-            selectedIndex: sel,
-            responseTimeMs: elapsed,
-          );
+      final receipt = await repo.submitAnswer(
+        sessionId: widget.sessionId,
+        student: user,
+        questionIndex: index,
+        selectedIndex: selected,
+      );
+      if (mounted) setState(() => _submitted[index] = receipt);
     } catch (e) {
       if (mounted) showSnack(context, '$e', error: true);
     } finally {
@@ -107,44 +123,120 @@ class _PlaySessionScreenState extends ConsumerState<PlaySessionScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final session = ref.watch(sessionProvider(widget.sessionId));
+    final sessionAsync = ref.watch(sessionProvider(widget.sessionId));
+    final link = ref.watch(liveConnectionProvider);
     final user = ref.watch(currentUserProvider);
+    final session = sessionAsync.valueOrNull;
 
-    ref.listen(sessionProvider(widget.sessionId), (_, next) {
-      final s = next.valueOrNull;
-      if (s != null && s.isEnded) context.go('/results/${widget.sessionId}');
+    ref.listen(sessionProvider(widget.sessionId), (previous, next) {
+      final before = previous?.valueOrNull;
+      final after = next.valueOrNull;
+      if (after == null) return;
+      if (after.isEnded) {
+        GoRouter.maybeOf(context)?.go('/results/${widget.sessionId}');
+        return;
+      }
+      if (before?.currentQuestionIndex != after.currentQuestionIndex) {
+        // A new question starts with nothing selected.
+        _pending.removeWhere((key, _) => key != after.currentQuestionIndex);
+      }
     });
+
+    if (session != null && session.isEnded) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (context.mounted) {
+          GoRouter.maybeOf(context)?.go('/results/${widget.sessionId}');
+        }
+      });
+      return const Scaffold(
+        body: Center(child: LoadingView(label: 'Loading results…')),
+      );
+    }
+
+    final Widget body;
+    final String bodyKey;
+    if (session == null) {
+      bodyKey = 'status';
+      if (sessionAsync.isLoading) {
+        body = const LoadingView(label: 'Joining the session');
+      } else if (sessionAsync.hasError) {
+        body = ErrorView(
+          message: '${sessionAsync.error}',
+          onRetry: () => ref.invalidate(sessionProvider(widget.sessionId)),
+        );
+      } else {
+        body = EmptyView(
+          icon: Icons.link_off,
+          title: 'This session has closed',
+          subtitle: 'Ask your teacher for a new join code.',
+          action: BauhausButton.primary(
+            label: 'Enter a code',
+            onPressed: () => GoRouter.maybeOf(context)?.go('/join'),
+          ),
+        );
+      }
+    } else if (user == null) {
+      bodyKey = 'status';
+      body = const LoadingView(label: 'Loading your account');
+    } else if (session.isLobby) {
+      bodyKey = 'lobby';
+      body = _WaitingRoom(sessionId: widget.sessionId);
+    } else {
+      bodyKey = 'live';
+      final index = session.currentQuestionIndex;
+      body = _LiveBody(
+        sessionId: widget.sessionId,
+        session: session,
+        studentId: user.id,
+        selection: _pending[index],
+        receipt: _submitted[index],
+        submitting: _submittingForIndex == index,
+        onSelect: (option) => setState(() => _pending[index] = option),
+        onSubmit: () => _submit(session, index),
+      );
+    }
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Live quiz'),
-        leading: BackButton(onPressed: () => context.go('/')),
-      ),
-      body: session.when(
-        loading: () => const LoadingView(),
-        error: (e, _) => ErrorView(
-          message: '$e',
-          onRetry: () => ref.invalidate(sessionProvider(widget.sessionId)),
+        title: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const EyebrowLabel('Live quiz'),
+            Text(
+              session?.quizTitle ?? 'Live quiz',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: Theme.of(context).appBarTheme.titleTextStyle,
+            ),
+          ],
         ),
-        data: (s) {
-          if (s == null) {
-            return ErrorView(
-              message: 'This session is no longer available.',
-              onRetry: () => context.go('/join'),
-            );
-          }
-          if (user == null) return const LoadingView();
-          if (s.isLobby) return _WaitingRoom(sessionId: widget.sessionId);
-          return _LiveBody(
-            sessionId: widget.sessionId,
-            session: s,
-            studentId: user.id,
-            pendingSelection: _pendingSelection,
-            submitting: _submittingForIndex == s.currentQuestionIndex,
-            onSelect: (i) => setState(() => _pendingSelection = i),
-            onSubmit: () => _submit(s, s.currentQuestionIndex),
-          );
-        },
+        leading: BauhausIconButton(
+          icon: Icons.close,
+          tooltip: 'Leave quiz',
+          semanticLabel: 'Leave the quiz and go home',
+          bordered: false,
+          onPressed: () => GoRouter.maybeOf(context)?.go('/'),
+        ),
+      ),
+      body: SafeArea(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            AnimatedSize(
+              duration: Motion.dur(context, durQuick),
+              curve: easeSnap,
+              alignment: Alignment.topCenter,
+              child: ConnectionBanner(
+                state: link,
+                onRetry: () => ref.read(backendProvider).resumeRealtime(),
+              ),
+            ),
+            Expanded(
+              child: PlaneSwitcher(switchKey: bodyKey, child: body),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -152,24 +244,77 @@ class _PlaySessionScreenState extends ConsumerState<PlaySessionScreen> {
 
 class _WaitingRoom extends ConsumerWidget {
   const _WaitingRoom({required this.sessionId});
+
   final String sessionId;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final ps =
+    final theme = Theme.of(context);
+    final t = QuizzleTokens.of(context);
+    final players =
         ref.watch(participantsProvider(sessionId)).valueOrNull ?? const [];
+
     return Center(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          const Icon(Icons.check_circle, color: Color(0xFF1F9E5B), size: 56),
-          const SizedBox(height: 12),
-          Text("You're in!", style: Theme.of(context).textTheme.headlineSmall),
-          const SizedBox(height: 6),
-          const Text('Waiting for the host to start…'),
-          const SizedBox(height: 16),
-          Text('${ps.length} player${ps.length == 1 ? "" : "s"} in the lobby'),
-        ],
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.all(24),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 460),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: staggered([
+              // A filled square: the geometric signal for "ready".
+              ExcludeSemantics(
+                child: Row(
+                  children: [
+                    Container(width: 22, height: 22, color: t.correct),
+                    const SizedBox(width: 10),
+                    EyebrowLabel('You are in', color: t.ink),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 14),
+              Semantics(
+                header: true,
+                child: Text(
+                  'Waiting for the host to start',
+                  style: theme.textTheme.displaySmall,
+                ),
+              ),
+              const SizedBox(height: 10),
+              Text(
+                'Keep this screen open. The first question appears here the '
+                'moment your teacher starts the quiz.',
+                style: theme.textTheme.bodyMedium,
+              ),
+              const SizedBox(height: 20),
+              Semantics(
+                liveRegion: true,
+                label:
+                    '${players.length} ${players.length == 1 ? "player" : "players"} '
+                    'in the lobby',
+                excludeSemantics: true,
+                child: Container(
+                  decoration: t.plane(fill: t.surface),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 14,
+                  ),
+                  child: Row(
+                    children: [
+                      Expanded(child: EyebrowLabel('In the lobby')),
+                      CountUp(
+                        value: players.length,
+                        liveRegion: false,
+                        style: theme.textTheme.headlineMedium,
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ]),
+          ),
+        ),
       ),
     );
   }
@@ -180,7 +325,8 @@ class _LiveBody extends ConsumerWidget {
     required this.sessionId,
     required this.session,
     required this.studentId,
-    required this.pendingSelection,
+    required this.selection,
+    required this.receipt,
     required this.submitting,
     required this.onSelect,
     required this.onSubmit,
@@ -189,199 +335,465 @@ class _LiveBody extends ConsumerWidget {
   final String sessionId;
   final QuizSession session;
   final String studentId;
-  final int? pendingSelection;
+  final int? selection;
+  final QuizResponse? receipt;
   final bool submitting;
   final ValueChanged<int> onSelect;
   final VoidCallback onSubmit;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final idx = session.currentQuestionIndex;
+    final theme = Theme.of(context);
+    final t = QuizzleTokens.of(context);
+    final gutter = t.gutterFor(MediaQuery.sizeOf(context).width);
+    final clock = ref.watch(serverClockProvider);
+
+    final index = session.currentQuestionIndex;
     final revealing = session.phase == SessionPhase.revealing;
     final questionAsync = ref.watch(
-      publicQuestionProvider((sessionId: sessionId, index: idx)),
+      publicQuestionProvider((sessionId: sessionId, index: index)),
     );
-    final responses =
-        ref.watch(sessionResponsesProvider(sessionId)).valueOrNull ?? const [];
-    final participants =
+    final reveal = ref.watch(revealProvider(sessionId)).valueOrNull;
+    final result = (ref.watch(myResultsProvider(sessionId)).valueOrNull ??
+        const <int, AnswerResult>{})[index];
+    final players =
         ref.watch(participantsProvider(sessionId)).valueOrNull ?? const [];
 
-    // Keep the reveal-phase question fresh (answer key appears on reveal).
-    ref.listen(sessionProvider(sessionId), (prev, next) {
-      final a = prev?.valueOrNull;
-      final b = next.valueOrNull;
-      if (a?.phase != b?.phase ||
-          a?.currentQuestionIndex != b?.currentQuestionIndex) {
-        ref.invalidate(
-          publicQuestionProvider((sessionId: sessionId, index: idx)),
+    SessionParticipant? me;
+    for (final p in players) {
+      if (p.studentId == studentId) me = p;
+    }
+    final myRank = players.indexWhere((p) => p.studentId == studentId) + 1;
+
+    // "Answered" survives a reload through the server's roster, not just the
+    // local receipt.
+    final answered =
+        receipt != null ||
+        (result?.answered ?? false) ||
+        (me?.lastAnsweredIndex ?? -1) >= index;
+    final chosen = result?.selectedIndex ?? receipt?.selectedIndex ?? selection;
+
+    final question = questionAsync.valueOrNull;
+    // The key only ever comes from a reveal for *this* question. Until then
+    // the question stays redacted and nothing indexes it with -1.
+    final applicable = revealing && reveal?.questionIndex == index
+        ? reveal
+        : null;
+    final shown = question == null
+        ? null
+        : (applicable?.applyTo(question) ?? question);
+    final keyRevealed = shown != null && revealing && shown.correctIndex >= 0;
+
+    Widget questionArea() {
+      if (shown == null) {
+        if (questionAsync.hasError) {
+          return ErrorView(
+            message: '${questionAsync.error}',
+            onRetry: () => ref.invalidate(
+              publicQuestionProvider((sessionId: sessionId, index: index)),
+            ),
+          );
+        }
+        return const Padding(
+          padding: EdgeInsets.symmetric(vertical: 48),
+          child: LoadingView(label: 'Loading the question'),
         );
       }
-    });
-
-    QuizResponse? mine;
-    for (final r in responses) {
-      if (r.studentId == studentId && r.questionIndex == idx) mine = r;
-    }
-    final me = participants
-        .where((p) => p.studentId == studentId)
-        .cast<SessionParticipant?>()
-        .firstWhere((_) => true, orElse: () => null);
-    final myRank = participants.indexWhere((p) => p.studentId == studentId) + 1;
-
-    final t = Theme.of(context);
-
-    return questionAsync.when(
-      loading: () => const LoadingView(),
-      error: (e, _) => ErrorView(message: '$e'),
-      data: (q) {
-        if (q == null) return const LoadingView();
-        final answered = mine != null;
-        return ContentContainer(
-          maxWidth: 760,
-          child: ListView(
-            children: [
-              Row(
-                children: [
-                  Text(
-                    'Q${idx + 1} / ${session.totalQuestions}',
-                    style: t.textTheme.titleMedium,
-                  ),
-                  const Spacer(),
-                  if (me != null)
-                    Text(
-                      '${me.totalScore} pts'
-                      '${myRank > 0 ? "  ·  #$myRank" : ""}',
-                      style: t.textTheme.titleMedium,
-                    ),
-                  const SizedBox(width: 12),
-                  if (!revealing && session.questionEndsAt != null)
-                    CountdownRing(
-                      deadline: session.questionEndsAt!,
-                      total: Duration(seconds: q.timeLimitSeconds),
-                      size: 56,
-                    ),
-                ],
-              ),
-              const SizedBox(height: 14),
-              Text(q.text, style: t.textTheme.headlineSmall),
-              const SizedBox(height: 18),
-              OptionGrid(
-                options: q.options,
-                selectedIndex: revealing
-                    ? mine?.selectedIndex
-                    : (pendingSelection ?? mine?.selectedIndex),
-                correctIndex: revealing ? q.correctIndex : null,
-                enabled: !revealing && !answered,
-                onTap: onSelect,
-              ),
-              const SizedBox(height: 18),
-              if (!revealing)
-                if (answered)
-                  _Pill(
-                    icon: Icons.lock_outline,
-                    text: 'Answer locked in. Waiting for others…',
-                    color: t.colorScheme.primary,
-                  )
-                else
-                  FilledButton(
-                    onPressed: pendingSelection == null || submitting
-                        ? null
-                        : onSubmit,
-                    child: submitting
-                        ? const SizedBox(
-                            height: 20,
-                            width: 20,
-                            child: CircularProgressIndicator(strokeWidth: 2),
-                          )
-                        : const Text('Submit answer'),
-                  )
-              else
-                _RevealPanel(mine: mine, question: q),
-              if (revealing) ...[
-                const SizedBox(height: 20),
-                Text('Leaderboard', style: t.textTheme.titleMedium),
-                const SizedBox(height: 8),
-                LeaderboardList(
-                  rows: rowsFromParticipants(
-                    participants,
-                    highlightStudentId: studentId,
-                  ),
-                  dense: true,
-                ),
-              ],
-            ],
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          QuestionHeading(text: shown.text, focusOnMount: true),
+          const SizedBox(height: 18),
+          AnswerTileGrid(
+            // Keyed by question only: the same tiles stay mounted through the
+            // reveal, so the correct one wipes instead of re-entering.
+            key: ValueKey('play-$index'),
+            options: shown.options,
+            selectedIndex: keyRevealed ? result?.selectedIndex ?? chosen : chosen,
+            correctIndex: keyRevealed ? shown.correctIndex : null,
+            lockedIn: answered,
+            enabled: !revealing && !answered,
+            onSelect: (revealing || answered) ? null : onSelect,
           ),
-        );
-      },
-    );
-  }
-}
+        ],
+      );
+    }
 
-class _RevealPanel extends StatelessWidget {
-  const _RevealPanel({required this.mine, required this.question});
-  final QuizResponse? mine;
-  final dynamic question;
-
-  @override
-  Widget build(BuildContext context) {
-    final correct = mine?.isCorrect ?? false;
-    final points = mine?.pointsAwarded ?? 0;
-    final noAnswer = mine == null || mine!.selectedIndex < 0;
-    final color = correct
-        ? const Color(0xFF1F9E5B)
-        : Theme.of(context).colorScheme.error;
     return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Row(
-          children: [
-            Icon(correct ? Icons.check_circle : Icons.cancel, color: color),
-            const SizedBox(width: 8),
-            Text(
-              noAnswer
-                  ? 'No answer'
-                  : correct
-                  ? 'Correct!  +$points'
-                  : 'Not quite',
-              style: TextStyle(
-                color: color,
-                fontWeight: FontWeight.w800,
-                fontSize: 18,
+        Expanded(
+          child: SingleChildScrollView(
+            padding: EdgeInsets.symmetric(horizontal: gutter, vertical: gutter),
+            child: Center(
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 760),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    _LiveHeader(
+                      index: index,
+                      total: session.totalQuestions,
+                      score: me?.totalScore ?? 0,
+                      rank: myRank,
+                      streak: me?.streak ?? 0,
+                      deadline: revealing ? null : session.questionEndsAt,
+                      timeLimit: Duration(
+                        seconds: shown?.timeLimitSeconds ?? 20,
+                      ),
+                      now: clock.now,
+                      // Time is up: send whatever is selected rather than
+                      // dropping it. The server allows 750 ms of grace.
+                      onExpire: () {
+                        if (!answered && selection != null) onSubmit();
+                      },
+                    ),
+                    const SizedBox(height: 18),
+                    PlaneSwitcher(
+                      switchKey: 'q-$index-${shown == null}',
+                      child: questionArea(),
+                    ),
+                    if (revealing) ...[
+                      const SizedBox(height: 18),
+                      PlaneSwitcher(
+                        switchKey: 'outcome-$index-$keyRevealed',
+                        animateSize: true,
+                        duration: durSlow,
+                        child: keyRevealed
+                            ? _RevealPanel(
+                                question: shown,
+                                result: result,
+                                localChoice: chosen,
+                                answered: answered,
+                              )
+                            : const _RevealPending(),
+                      ),
+                    ],
+                    // Mounted for the whole session and only shown while
+                    // revealing, so a rank change slides and a score counts
+                    // on from its last value instead of from zero.
+                    Visibility(
+                      visible: revealing,
+                      maintainState: true,
+                      child: Padding(
+                        padding: const EdgeInsets.only(top: 24),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            const SectionHeader(
+                              eyebrow: 'Standings',
+                              title: 'Leaderboard',
+                            ),
+                            const SizedBox(height: 12),
+                            LeaderboardList(
+                              rows: rowsFromParticipants(
+                                players,
+                                highlightStudentId: studentId,
+                              ),
+                              dense: true,
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 24),
+                    Text(
+                      session.isLastQuestion
+                          ? 'Last question — results next.'
+                          : 'The host controls when the quiz moves on.',
+                      style: theme.textTheme.bodySmall?.copyWith(color: t.ink),
+                    ),
+                  ],
+                ),
               ),
             ),
-          ],
+          ),
         ),
-        if ((question.explanation as String).isNotEmpty) ...[
-          const SizedBox(height: 8),
-          Text(question.explanation as String),
-        ],
+        if (!revealing && shown != null)
+          _SubmitBar(
+            gutter: gutter,
+            child: PlaneSwitcher(
+              switchKey: 'submit-$index-$answered',
+              animateSize: true,
+              child: answered
+                  ? _LockedIn(hasLocalCopy: receipt != null)
+                  : BauhausButton.primary(
+                      label: 'Submit answer',
+                      trailingIcon: Icons.lock_outline,
+                      semanticLabel: selection == null
+                          ? 'Submit answer. Pick an option first.'
+                          : 'Submit option ${AnswerTile.letterFor(selection!)}',
+                      expand: true,
+                      busy: submitting,
+                      onPressed: selection == null || submitting
+                          ? null
+                          : onSubmit,
+                    ),
+            ),
+          ),
       ],
     );
   }
 }
 
-class _Pill extends StatelessWidget {
-  const _Pill({required this.icon, required this.text, required this.color});
-  final IconData icon;
-  final String text;
-  final Color color;
+/// The action strip pinned to the bottom edge: always reachable by a thumb,
+/// whatever the length of the question above it.
+class _SubmitBar extends StatelessWidget {
+  const _SubmitBar({required this.gutter, required this.child});
+
+  final double gutter;
+  final Widget child;
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+    final t = QuizzleTokens.of(context);
+    return DecoratedBox(
       decoration: BoxDecoration(
-        color: color.withValues(alpha: 0.12),
-        borderRadius: BorderRadius.circular(12),
+        color: t.surface,
+        border: Border(top: BorderSide(color: t.line, width: t.borderWidth)),
       ),
-      child: Row(
-        children: [
-          Icon(icon, color: color, size: 20),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(text, style: TextStyle(color: color)),
+      child: Padding(
+        padding: EdgeInsets.symmetric(horizontal: gutter, vertical: 12),
+        child: Center(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 760),
+            child: child,
           ),
-        ],
+        ),
+      ),
+    );
+  }
+}
+
+class _LiveHeader extends StatelessWidget {
+  const _LiveHeader({
+    required this.index,
+    required this.total,
+    required this.score,
+    required this.rank,
+    required this.streak,
+    required this.deadline,
+    required this.timeLimit,
+    required this.now,
+    required this.onExpire,
+  });
+
+  final int index;
+  final int total;
+  final int score;
+  final int rank;
+  final int streak;
+  final DateTime? deadline;
+  final Duration timeLimit;
+  final DateTime Function() now;
+  final VoidCallback onExpire;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final t = QuizzleTokens.of(context);
+
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              EyebrowLabel('Question ${index + 1} of $total'),
+              const SizedBox(height: 8),
+              // Score is a live region: it must reach a screen reader.
+              CountUp(
+                value: score,
+                suffix: ' pts',
+                style: theme.textTheme.displaySmall,
+                semanticsLabel: rank > 0
+                    ? 'Score, $score points, rank $rank'
+                    : 'Score, $score points',
+              ),
+              if (rank > 0 || streak >= 2) ...[
+                const SizedBox(height: 6),
+                Text(
+                  [
+                    if (rank > 0) 'Rank $rank',
+                    if (streak >= 2) '$streak in a row',
+                  ].join(' · '),
+                  style: theme.textTheme.labelMedium?.copyWith(color: t.ink),
+                ),
+              ],
+            ],
+          ),
+        ),
+        const SizedBox(width: 16),
+        if (deadline != null)
+          CountdownSquare(
+            deadline: deadline!,
+            total: timeLimit,
+            size: 84,
+            now: now,
+            onExpire: onExpire,
+          ),
+      ],
+    );
+  }
+}
+
+class _LockedIn extends StatelessWidget {
+  const _LockedIn({required this.hasLocalCopy});
+
+  final bool hasLocalCopy;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final t = QuizzleTokens.of(context);
+    final message = hasLocalCopy
+        ? 'Answer locked in. Waiting for the rest of the class…'
+        : 'You already answered this question.';
+
+    return Semantics(
+      liveRegion: true,
+      label: message,
+      excludeSemantics: true,
+      child: Container(
+        constraints: BoxConstraints(minHeight: t.minTouchTarget),
+        decoration: t.plane(fill: t.surface),
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        child: Row(
+          children: [
+            Icon(Icons.lock_outline, color: t.ink),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(message, style: theme.textTheme.titleSmall),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Between the phase flip and the key arriving (normally one frame; longer
+/// after a reconnect while the channel restores the reveal).
+class _RevealPending extends StatelessWidget {
+  const _RevealPending();
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final t = QuizzleTokens.of(context);
+    return Semantics(
+      liveRegion: true,
+      label: 'Revealing the answer',
+      excludeSemantics: true,
+      child: Container(
+        decoration: t.plane(fill: t.surface),
+        padding: const EdgeInsets.all(16),
+        child: Row(
+          children: [
+            MarchingSquares(color: t.ink),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Text(
+                'Revealing the answer…',
+                style: theme.textTheme.titleSmall,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _RevealPanel extends StatelessWidget {
+  const _RevealPanel({
+    required this.question,
+    required this.result,
+    required this.localChoice,
+    required this.answered,
+  });
+
+  /// Always revealed here: `correctIndex >= 0`.
+  final Question question;
+
+  /// The server's verdict, from `answer.result`. Arrives right after the key.
+  final AnswerResult? result;
+
+  /// What this device knows was chosen, for the moment before [result].
+  final int? localChoice;
+  final bool answered;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final t = QuizzleTokens.of(context);
+
+    final choice = result?.selectedIndex ?? (answered ? localChoice : null);
+    final noAnswer = choice == null || choice < 0;
+    final correct = result?.isCorrect ?? (!noAnswer && choice == question.correctIndex);
+    final points = result?.pointsAwarded;
+
+    final (Color fill, String headline) = noAnswer
+        ? (t.inkMuted, answered ? 'Answer submitted' : 'No answer')
+        : correct
+        ? (t.correct, points == null ? 'Correct' : 'Correct  +$points')
+        : (t.wrong, 'Not quite');
+
+    final onFill = noAnswer ? t.ink : QuizzleColors.paper;
+    final letter = AnswerTile.letterFor(question.correctIndex);
+    final answerText = question.options[question.correctIndex];
+
+    return Semantics(
+      // The reveal outcome must be announced the moment it lands.
+      liveRegion: true,
+      label:
+          '$headline. The answer was option $letter, $answerText.'
+          '${question.explanation.isEmpty ? '' : ' ${question.explanation}'}',
+      excludeSemantics: true,
+      child: Container(
+        decoration: t.plane(fill: fill),
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Row(
+              children: [
+                Icon(
+                  noAnswer
+                      ? Icons.timer_off_outlined
+                      : correct
+                      ? Icons.check
+                      : Icons.close,
+                  color: onFill,
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    headline,
+                    style: theme.textTheme.headlineMedium?.copyWith(
+                      color: onFill,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            Text(
+              'Answer: option $letter · $answerText',
+              style: theme.textTheme.titleSmall?.copyWith(color: onFill),
+            ),
+            if (question.explanation.isNotEmpty) ...[
+              const SizedBox(height: 10),
+              Text(
+                question.explanation,
+                style: theme.textTheme.bodyMedium?.copyWith(color: onFill),
+              ),
+            ],
+          ],
+        ),
       ),
     );
   }

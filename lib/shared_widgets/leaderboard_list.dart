@@ -47,9 +47,13 @@ List<LeaderRow> rowsFromParticipants(
         rank: i + 1,
         name: ps[i].displayName,
         points: ps[i].totalScore,
-        highlight: ps[i].studentId == highlightStudentId,
+        highlight:
+            highlightStudentId != null &&
+            ps[i].studentId == highlightStudentId,
         subtitle: ps[i].streak >= 2 ? '${ps[i].streak} in a row' : null,
-        id: ps[i].studentId,
+        // The participant id, which every row has. The student id is blank on
+        // rows that arrived as realtime deltas, so it cannot key a row.
+        id: ps[i].id,
       ),
   ];
 }
@@ -101,39 +105,89 @@ class LeaderboardList extends StatelessWidget {
       );
     }
 
-    return ListView.separated(
+    final gap = dense ? 6.0 : 8.0;
+
+    // The key must sit on the outermost widget of each row. It used to sit on
+    // the tile *inside* the stagger wrapper, so a reorder matched rows by
+    // position, threw both tiles away and rebuilt them: no slide, and every
+    // score counted up from zero again.
+    Widget item(int i) {
+      final row = rows[i];
+      final tile = _LeaderRowTile(
+        row: row,
+        dense: dense,
+        animate: animate,
+        gap: gap,
+        onTap: onTapRow == null ? null : () => onTapRow!(row),
+      );
+      return KeyedSubtree(
+        key: ValueKey(row.key),
+        child: StaggeredEntry(index: i, enabled: stagger, child: tile),
+      );
+    }
+
+    // Embedded boards (the live screens, results) are short and scroll with
+    // their page: a keyed Column moves elements on reorder for free.
+    if (shrinkWrap && physics is NeverScrollableScrollPhysics) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          for (var i = 0; i < rows.length; i++)
+            Padding(
+              key: ValueKey('gap-${rows[i].key}'),
+              padding: EdgeInsets.only(top: i == 0 ? 0 : gap),
+              child: item(i),
+            ),
+        ],
+      );
+    }
+
+    // A long scrolling board stays lazy. findChildIndexCallback lets the
+    // sliver find a moved row by key instead of rebuilding it.
+    final indexByKey = {for (var i = 0; i < rows.length; i++) rows[i].key: i};
+    return ListView.builder(
       shrinkWrap: shrinkWrap,
       physics: physics,
       padding: EdgeInsets.zero,
       itemCount: rows.length,
-      separatorBuilder: (_, _) => SizedBox(height: dense ? 6 : 8),
-      itemBuilder: (context, i) {
-        final row = rows[i];
-        final entry = _LeaderRowTile(
-          key: ValueKey(row.key),
-          row: row,
-          dense: dense,
-          animate: animate,
-          onTap: onTapRow == null ? null : () => onTapRow!(row),
-        );
-        return stagger ? StaggeredEntry(index: i, child: entry) : entry;
-      },
+      findChildIndexCallback: (key) =>
+          key is ValueKey<String> ? indexByKey[key.value] : null,
+      itemBuilder: (context, i) => KeyedSubtree(
+        key: ValueKey(rows[i].key),
+        child: Padding(
+          padding: EdgeInsets.only(top: i == 0 ? 0 : gap),
+          child: StaggeredEntry(
+            index: i,
+            enabled: stagger,
+            child: _LeaderRowTile(
+              row: rows[i],
+              dense: dense,
+              animate: animate,
+              gap: gap,
+              onTap: onTapRow == null ? null : () => onTapRow!(rows[i]),
+            ),
+          ),
+        ),
+      ),
     );
   }
 }
 
 class _LeaderRowTile extends StatefulWidget {
   const _LeaderRowTile({
-    super.key,
     required this.row,
     required this.dense,
     required this.animate,
+    required this.gap,
     this.onTap,
   });
 
   final LeaderRow row;
   final bool dense;
   final bool animate;
+
+  /// Space between rows, so a slide travels whole row pitches.
+  final double gap;
   final VoidCallback? onTap;
 
   @override
@@ -147,21 +201,26 @@ class _LeaderRowTileState extends State<_LeaderRowTile>
     duration: durBase,
   );
 
-  /// Where the row starts from, in units of its own height.
-  double _from = 0;
+  /// Where the row starts from, in logical pixels.
+  double _fromPx = 0;
 
   @override
   void didUpdateWidget(covariant _LeaderRowTile old) {
     super.didUpdateWidget(old);
     if (old.row.rank != widget.row.rank) {
       if (Motion.reduced(context)) {
-        _from = 0;
+        _fromPx = 0;
         _slide.value = 1;
       } else {
         // Moving up two places means it *was* two rows lower; start there and
-        // travel to zero. FractionalTranslation is relative to this row's own
-        // height, so this is text-scale independent.
-        _from = (old.row.rank - widget.row.rank).toDouble();
+        // travel to zero. The pitch is this row's own laid-out height plus the
+        // gap, so the slide is right at any text scale.
+        // didUpdateWidget runs during build, so read last frame's layout from
+        // the render box rather than `context.size`, which asserts here.
+        final box = context.findRenderObject();
+        final height = box is RenderBox && box.hasSize ? box.size.height : 56.0;
+        final pitch = height + widget.gap;
+        _fromPx = (old.row.rank - widget.row.rank) * pitch;
         _slide.forward(from: 0);
       }
     }
@@ -278,17 +337,14 @@ class _LeaderRowTileState extends State<_LeaderRowTile>
       );
     }
 
-    if (_from == 0) return tile;
-
+    // Always wrapped, even at rest: adding the wrapper only when a rank changed
+    // would rebuild the row (and restart its count-up) at exactly that moment.
     return AnimatedBuilder(
       animation: _slide,
       child: tile,
       builder: (context, child) {
-        final dy = _from * (1 - easeSnap.transform(_slide.value));
-        return FractionalTranslation(
-          translation: Offset(0, dy),
-          child: child,
-        );
+        final dy = _fromPx * (1 - easeSnap.transform(_slide.value));
+        return Transform.translate(offset: Offset(0, dy), child: child);
       },
     );
   }

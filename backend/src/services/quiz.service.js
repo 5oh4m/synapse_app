@@ -140,6 +140,35 @@ async function setStatus(quizId, ownerId, status) {
 export const listQuestions = (quizId) =>
   many(`SELECT ${QUESTION_COLS} FROM questions WHERE quiz_id = $1 ORDER BY order_index`, [quizId]);
 
+/** One question of one quiz, or 404. */
+export async function quizQuestion(quizId, questionId) {
+  const row = await one(`SELECT ${QUESTION_COLS} FROM questions WHERE id = $1 AND quiz_id = $2`, [
+    questionId,
+    quizId,
+  ]);
+  if (!row) throw notFound('Question not found.');
+  return row;
+}
+
+/**
+ * Refuses non-owner question reads while a session of this quiz is open. A live
+ * session's questions come from the quiz, so practice mode on the same quiz
+ * would otherwise hand out the text — and, graded, the key — mid-game.
+ * Sessions abandoned for 12 hours stop counting, so a forgotten lobby cannot
+ * lock a quiz forever.
+ */
+export async function assertNotLive(quizId) {
+  const live = await one(
+    `SELECT 1 FROM quiz_sessions
+      WHERE quiz_id = $1 AND status <> 'ended' AND created_at > now() - interval '12 hours'
+      LIMIT 1`,
+    [quizId],
+  );
+  if (live) {
+    throw conflict('This quiz is being played live right now. Practise it once the session ends.');
+  }
+}
+
 /** Appends validated questions after the current last one. */
 export async function appendQuestions(quizId, ownerId, rawList) {
   if (!Array.isArray(rawList) || rawList.length === 0) {

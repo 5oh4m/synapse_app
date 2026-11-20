@@ -4,15 +4,20 @@ import '../models/question.dart';
 
 class GenerationRequest {
   const GenerationRequest({
-    required this.sourceText,
+    this.sourceText = '',
     required this.count,
     required this.difficultyMix,
     this.subject = '',
     this.title = '',
+    this.contentId,
   });
 
   final String sourceText;
   final int count;
+
+  /// Library item to generate from. When set, the server reads the extracted
+  /// text itself (owner-scoped) instead of the client re-uploading it.
+  final String? contentId;
 
   /// Weights per difficulty, e.g. {easy: 3, medium: 5, hard: 2}. Values are
   /// relative; they do not need to sum to [count].
@@ -46,12 +51,17 @@ abstract class QuizGenerator {
   });
 
   /// Regenerate a single question, optionally avoiding text already in use.
+  ///
+  /// Pass [questionId] to regenerate **in place**: the returned question keeps
+  /// that id, so saving it replaces the existing row instead of appending a
+  /// duplicate at the same `order_index`.
   Future<Question> regenerateOne(
     GenerationRequest request, {
     required String quizId,
     required int orderIndex,
     required Difficulty difficulty,
     List<String> avoid = const [],
+    String? questionId,
   });
 }
 

@@ -1,37 +1,31 @@
-import 'package:dio/dio.dart';
-
-import '../core/env.dart';
 import '../core/failure.dart';
-import '../core/ids.dart';
+import '../data/remote/api_client.dart';
 import '../models/enums.dart';
 import '../models/question.dart';
 import 'quiz_generator.dart';
 
-/// Used with `BACKEND=remote`: generation runs on the Node server (which holds
-/// the AI key and can do real file extraction), the client just posts the
-/// request. Output is still validated here before it is shown for review.
+/// `POST /generate` on the backend.
+///
+/// Generation lives on the server because that is where the model key, the
+/// 20/hour rate limit and the retry/parse hardening are. The client never
+/// holds an AI key: a `--dart-define` is a compile-time constant that ends up
+/// readable inside `main.dart.js`.
+///
+/// Output is still validated here before it is shown for review, so a bad
+/// payload cannot reach the editor.
 class RemoteQuizGenerator implements QuizGenerator {
-  RemoteQuizGenerator({Dio? dio})
-    : _dio =
-          dio ??
-          Dio(
-            BaseOptions(
-              baseUrl: Env.apiBase,
-              connectTimeout: const Duration(seconds: 10),
-              receiveTimeout: const Duration(seconds: 120),
-              headers: {'content-type': 'application/json'},
-            ),
-          );
+  RemoteQuizGenerator(this._api);
 
-  final Dio _dio;
+  final ApiClient _api;
 
   Map<String, dynamic> _payload(GenerationRequest r) => {
-    'source_text': r.sourceText,
+    if (r.contentId != null) 'content_id': r.contentId,
+    if (r.contentId == null) 'source_text': r.sourceText,
     'count': r.count,
-    'subject': r.subject,
-    'title': r.title,
+    if (r.subject.isNotEmpty) 'subject': r.subject,
     'difficulty_mix': {
-      for (final e in r.difficultyMix.entries) e.key.name: e.value,
+      for (final e in r.difficultyMix.entries)
+        if (e.value > 0) e.key.name: e.value,
     },
   };
 
@@ -40,22 +34,15 @@ class RemoteQuizGenerator implements QuizGenerator {
     GenerationRequest request, {
     required String quizId,
   }) async {
-    try {
-      final res = await _dio.post<Map<String, dynamic>>(
-        '/generate',
-        data: _payload(request)..['quiz_id'] = quizId,
-      );
-      final parsed = parseAndValidate(
-        res.data,
-        quizId: quizId,
-        expectedCount: request.count,
-      );
-      return [
-        for (var i = 0; i < parsed.length; i++) _withId(parsed[i], quizId, i),
-      ];
-    } on DioException catch (e) {
-      throw AppFailure(_msg(e) ?? 'Generation failed on the server.', cause: e);
-    }
+    final res = await _api.post('/generate', body: _payload(request));
+    final parsed = parseAndValidate(
+      res,
+      quizId: quizId,
+      expectedCount: request.count,
+    );
+    return [
+      for (var i = 0; i < parsed.length; i++) _timed(parsed[i], orderIndex: i),
+    ];
   }
 
   @override
@@ -65,51 +52,48 @@ class RemoteQuizGenerator implements QuizGenerator {
     required int orderIndex,
     required Difficulty difficulty,
     List<String> avoid = const [],
+    String? questionId,
   }) async {
-    try {
-      final res = await _dio.post<Map<String, dynamic>>(
-        '/generate',
-        data: _payload(request)
-          ..['quiz_id'] = quizId
-          ..['count'] = 1
-          ..['difficulty_mix'] = {difficulty.name: 1}
-          ..['avoid'] = avoid,
-      );
-      final parsed = parseAndValidate(
-        res.data,
-        quizId: quizId,
-        expectedCount: 1,
-      );
-      return _withId(
-        parsed.first,
-        quizId,
-        orderIndex,
-      ).copyWith(difficulty: difficulty);
-    } on DioException catch (e) {
-      throw AppFailure(_msg(e) ?? 'Regeneration failed.', cause: e);
-    }
+    final res = await _api.post(
+      '/generate',
+      body: _payload(request)
+        ..['count'] = 1
+        ..['difficulty_mix'] = {difficulty.name: 1},
+    );
+    final parsed = parseAndValidate(res, quizId: quizId, expectedCount: 1);
+    // The server has no "avoid" parameter; picking the first result that is not
+    // already on the quiz is done here rather than pretended about there.
+    final avoidSet = avoid.map(_normalize).toSet();
+    final pick = parsed.firstWhere(
+      (q) => !avoidSet.contains(_normalize(q.text)),
+      orElse: () => parsed.first,
+    );
+    final timed = _timed(
+      pick,
+      orderIndex: orderIndex,
+    ).copyWith(difficulty: difficulty);
+    // With an id the caller can PUT it straight over the existing row.
+    return questionId == null ? timed : timed.withId(questionId);
   }
 
-  Question _withId(Question q, String quizId, int i) => Question(
-    id: newId(),
-    quizId: quizId,
-    text: q.text,
-    options: q.options,
-    correctIndex: q.correctIndex,
-    explanation: q.explanation,
-    difficulty: q.difficulty,
-    sourceReference: q.sourceReference,
-    orderIndex: i,
-    timeLimitSeconds: switch (q.difficulty) {
-      Difficulty.easy => 15,
-      Difficulty.medium => 20,
-      Difficulty.hard => 30,
-    },
-  );
+  String _normalize(String s) => s.trim().toLowerCase();
 
-  String? _msg(DioException e) {
-    final d = e.response?.data;
-    if (d is Map && d['error'] is String) return d['error'] as String;
-    return null;
-  }
+  Question _timed(Question q, {required int orderIndex}) => q
+      .copyWith(
+        orderIndex: orderIndex,
+        timeLimitSeconds: q.timeLimitSeconds > 0
+            ? q.timeLimitSeconds
+            : switch (q.difficulty) {
+                Difficulty.easy => 15,
+                Difficulty.medium => 20,
+                Difficulty.hard => 30,
+              },
+      )
+      .withId('', quizId: q.quizId, orderIndex: orderIndex);
+
+  /// Surfaces the server's reason verbatim (rate limit, upstream parse
+  /// failure, "not enough source text") rather than a generic message.
+  static AppFailure describe(Object error) => error is AppFailure
+      ? error
+      : AppFailure('Generation failed: $error', code: 'UPSTREAM');
 }

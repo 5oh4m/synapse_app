@@ -20,6 +20,7 @@ import {
   sessionQuestionJson,
   redactQuestion,
   responseJson,
+  answerResultJson,
 } from '../util/serialize.js';
 import { assertUuid, str, int, rejectIdentityFields } from '../util/validate.js';
 import * as svc from '../services/session.service.js';
@@ -102,7 +103,12 @@ sessionRoutes.get('/:id/questions', requireAuth, async (req, res) => {
   res.json((await q.listSessionQuestions(a.session.id)).map(sessionQuestionJson));
 });
 
-/** Redacted until the question is revealed (or the session has ended). */
+/**
+ * Redacted until the question is revealed (or the session has ended), and
+ * never ahead of the class: a participant cannot read a question that has not
+ * been asked yet. Without that ceiling `?index=N` served every upcoming
+ * question's text and options from the lobby.
+ */
 sessionRoutes.get('/:id/current-question', requireAuth, async (req, res) => {
   const a = await requireMember(req);
   const s = a.session;
@@ -110,16 +116,17 @@ sessionRoutes.get('/:id/current-question', requireAuth, async (req, res) => {
   if (!Number.isInteger(index) || index < 0) {
     return res.json({ question: null, phase: s.phase, current_question_index: s.current_question_index });
   }
+  if (!a.isHost && (s.status === 'lobby' || index > s.current_question_index)) {
+    throw notFound('That question has not been asked yet.');
+  }
   const row = await q.getSessionQuestion(s.id, index);
   if (!row) throw notFound('That question is not in this session.');
 
-  const revealed =
-    s.status === 'ended' ||
-    index < s.current_question_index ||
-    (index === s.current_question_index && s.phase === 'revealing');
+  const revealed = q.isRevealed(s, index);
   // The host may see the key at any time; students only after reveal.
   const showKey = a.isHost || revealed;
   const json = sessionQuestionJson(row);
+  const mine = revealed && a.participantId ? await q.myResponse(a.participantId, index) : null;
 
   return res.json({
     question: showKey ? json : redactQuestion(json),
@@ -129,6 +136,9 @@ sessionRoutes.get('/:id/current-question', requireAuth, async (req, res) => {
     question_started_at: s.question_started_at,
     question_ends_at: s.question_ends_at,
     distribution: revealed ? await q.distribution(s.id, index) : null,
+    // The caller's own result, once it is public. Lets a device that reconnects
+    // during a reveal rebuild the outcome it missed.
+    my_response: mine ? answerResultJson(mine) : null,
   });
 });
 
@@ -152,9 +162,21 @@ sessionRoutes.post('/:id/answer', requireAuth, async (req, res) => {
     clientQuestionIndex,
   });
 
+  // Correctness is part of the answer key. Until the question is revealed the
+  // response confirms receipt only; otherwise a second account could test an
+  // option and pass the result on while the timer runs. Players get their own
+  // result in the `answer.result` frame at reveal.
+  const body = responseJson({ ...out.response, user_id: req.user.sub });
+  const revealed = q.isRevealed(out.session, out.response.question_index);
+  if (!revealed) {
+    delete body.is_correct;
+    delete body.points_awarded;
+  }
+
   // Double submit: the first result, 200, unchanged. A fresh score is 201.
   res.status(out.scored ? 201 : 200).json({
-    ...responseJson({ ...out.response, user_id: req.user.sub }),
+    ...body,
+    revealed,
     scored: out.scored,
     rescored: false,
     ignored_fields: ignoredFields,

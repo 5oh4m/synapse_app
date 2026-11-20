@@ -2,115 +2,178 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
-import '../../core/responsive.dart';
+import '../../app/motion.dart';
+import '../../app/theme.dart';
 import '../../models/enums.dart';
-import '../../state/providers.dart';
+import '../../shared_widgets/answer_distribution_bar.dart';
 import '../../shared_widgets/async_view.dart';
+import '../../shared_widgets/bauhaus_button.dart';
+import '../../shared_widgets/bauhaus_card.dart';
+import '../../shared_widgets/labels.dart';
 import '../../shared_widgets/leaderboard_list.dart';
+import '../../state/providers.dart';
 
+/// The end of a session: the podium rises, the scores count up, everybody sees
+/// where they landed.
 class FinalResultsScreen extends ConsumerWidget {
   const FinalResultsScreen({super.key, required this.sessionId});
+
   final String sessionId;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final session = ref.watch(sessionProvider(sessionId));
-    final participants = ref.watch(participantsProvider(sessionId));
+    final theme = Theme.of(context);
+    final t = QuizzleTokens.of(context);
+    final sessionAsync = ref.watch(sessionProvider(sessionId));
+    final participantsAsync = ref.watch(participantsProvider(sessionId));
     final user = ref.watch(currentUserProvider);
     final isEducator = user?.role == UserRole.educator;
+    final gutter = t.gutterFor(MediaQuery.sizeOf(context).width);
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Results'),
         automaticallyImplyLeading: false,
+        title: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const EyebrowLabel('Final'),
+            Text(
+              'Results',
+              style: Theme.of(context).appBarTheme.titleTextStyle,
+            ),
+          ],
+        ),
         actions: [
-          TextButton(
-            onPressed: () => context.go('/'),
-            child: const Text('Done'),
+          Padding(
+            padding: const EdgeInsets.only(right: 8),
+            child: BauhausButton.ghost(
+              label: 'Done',
+              semanticLabel: 'Close the results and go home',
+              onPressed: () => context.go('/'),
+            ),
           ),
         ],
       ),
-      body: session.when(
-        loading: () => const LoadingView(),
-        error: (e, _) => ErrorView(message: '$e'),
-        data: (s) => participants.when(
-          loading: () => const LoadingView(),
-          error: (e, _) => ErrorView(message: '$e'),
-          data: (ps) {
-            final rows = rowsFromParticipants(ps, highlightStudentId: user?.id);
-            final me = ps.indexWhere((p) => p.studentId == user?.id);
-            return ContentContainer(
-              maxWidth: 720,
-              child: ListView(
-                children: [
-                  const SizedBox(height: 8),
-                  Text(
-                    s?.quizTitle ?? 'Quiz',
-                    textAlign: TextAlign.center,
-                    style: Theme.of(context).textTheme.titleLarge,
+      body: SafeArea(
+        child: Builder(
+          builder: (context) {
+            if (participantsAsync.isLoading && !participantsAsync.hasValue) {
+              return const LoadingView(label: 'Counting the scores');
+            }
+            if (participantsAsync.hasError && !participantsAsync.hasValue) {
+              return ErrorView(
+                message: '${participantsAsync.error}',
+                onRetry: () =>
+                    ref.invalidate(participantsProvider(sessionId)),
+              );
+            }
+            final session = sessionAsync.valueOrNull;
+            final players = participantsAsync.valueOrNull ?? const [];
+            final rows = rowsFromParticipants(
+              players,
+              highlightStudentId: user?.id,
+            );
+            final myIndex = players.indexWhere(
+              (p) => p.studentId == user?.id,
+            );
+            final totalQuestions =
+                session?.totalQuestions ??
+                (myIndex >= 0 ? players[myIndex].answeredCount : 0);
+
+            if (players.isEmpty) {
+              return EmptyView(
+                icon: Icons.groups_outlined,
+                title: 'Nobody played this one',
+                subtitle: 'No scores were recorded for this session.',
+                action: BauhausButton.primary(
+                  label: 'Back to home',
+                  onPressed: () => context.go('/'),
+                ),
+              );
+            }
+
+            return Center(
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 760),
+                child: ListView(
+                  padding: EdgeInsets.symmetric(
+                    horizontal: gutter,
+                    vertical: gutter,
                   ),
-                  const SizedBox(height: 4),
-                  Text(
-                    'Final leaderboard',
-                    textAlign: TextAlign.center,
-                    style: Theme.of(context).textTheme.bodyMedium,
-                  ),
-                  const SizedBox(height: 20),
-                  Podium(rows: rows),
-                  const SizedBox(height: 24),
-                  if (!isEducator && me >= 0)
-                    Card(
-                      color: Theme.of(context).colorScheme.primaryContainer,
-                      child: Padding(
-                        padding: const EdgeInsets.all(16),
-                        child: Row(
-                          children: [
-                            Text(
-                              '#${me + 1}',
-                              style: const TextStyle(
-                                fontWeight: FontWeight.w900,
-                                fontSize: 22,
-                              ),
-                            ),
-                            const SizedBox(width: 16),
-                            Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Text(
-                                    '${ps[me].totalScore} points',
-                                    style: const TextStyle(
-                                      fontWeight: FontWeight.w700,
-                                      fontSize: 18,
-                                    ),
-                                  ),
-                                  Text(
-                                    '${ps[me].correctCount} / ${s?.totalQuestions ?? ps[me].answeredCount} correct',
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ],
-                        ),
+                  children: staggered([
+                    Semantics(
+                      header: true,
+                      child: Text(
+                        session?.quizTitle ?? 'Quiz',
+                        style: theme.textTheme.displaySmall,
                       ),
                     ),
-                  const SizedBox(height: 16),
-                  LeaderboardList(rows: rows),
-                  const SizedBox(height: 24),
-                  if (isEducator)
-                    FilledButton.icon(
-                      onPressed: () =>
-                          context.go('/analytics/quiz/${s?.quizId ?? ""}'),
-                      icon: const Icon(Icons.insights_outlined),
-                      label: const Text('View quiz analytics'),
-                    )
-                  else
-                    FilledButton.icon(
-                      onPressed: () => context.go('/leaderboard'),
-                      icon: const Icon(Icons.leaderboard_outlined),
-                      label: const Text('Global leaderboard'),
+                    const SizedBox(height: 6),
+                    Text(
+                      '${players.length} '
+                      '${players.length == 1 ? "player" : "players"} · '
+                      '$totalQuestions questions',
+                      style: theme.textTheme.bodyMedium?.copyWith(
+                        color: t.ink,
+                      ),
                     ),
-                ],
+                    const SizedBox(height: 24),
+                    // Animation 7: blocks rise from zero, 2nd -> 1st -> 3rd.
+                    Podium(rows: rows),
+                    const SizedBox(height: 28),
+                    if (!isEducator && myIndex >= 0) ...[
+                      RankBadge(
+                        rank: myIndex + 1,
+                        points: players[myIndex].totalScore,
+                        label: 'You finished',
+                        of: players.length,
+                      ),
+                      const SizedBox(height: 14),
+                      BauhausCard(
+                        child: BauhausMeter(
+                          factor: totalQuestions == 0
+                              ? 0
+                              : players[myIndex].correctCount / totalQuestions,
+                          label: 'Your accuracy',
+                          valueText:
+                              '${players[myIndex].correctCount} / $totalQuestions',
+                        ),
+                      ),
+                      const SizedBox(height: 28),
+                    ],
+                    const SectionHeader(
+                      eyebrow: 'Everyone',
+                      title: 'Final leaderboard',
+                    ),
+                    const SizedBox(height: 14),
+                    LeaderboardList(rows: rows),
+                    const SizedBox(height: 28),
+                    if (isEducator)
+                      BauhausButton.primary(
+                        label: 'View quiz analytics',
+                        icon: Icons.insights_outlined,
+                        expand: true,
+                        onPressed: () => context.go(
+                          '/analytics/quiz/${session?.quizId ?? ''}',
+                        ),
+                      )
+                    else
+                      BauhausButton.primary(
+                        label: 'Global leaderboard',
+                        icon: Icons.leaderboard_outlined,
+                        expand: true,
+                        onPressed: () => context.go('/leaderboard'),
+                      ),
+                    const SizedBox(height: 12),
+                    BauhausButton.secondary(
+                      label: 'Back to home',
+                      expand: true,
+                      onPressed: () => context.go('/'),
+                    ),
+                    const SizedBox(height: 24),
+                  ]),
+                ),
               ),
             );
           },

@@ -2,6 +2,7 @@
 // recording what ran in schema_migrations. Idempotent.
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { assertConfig, config, BACKEND_ROOT } from '../config.js';
 import { pool, withTransaction, closePool } from './pool.js';
 
@@ -42,7 +43,7 @@ export async function migrate({ silent = false } = {}) {
 }
 
 // Direct invocation: `npm run migrate`
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
   assertConfig();
   console.log(`migrating ${config.databaseUrl}`);
   migrate()

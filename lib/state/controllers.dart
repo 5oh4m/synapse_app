@@ -39,22 +39,14 @@ class AuthController extends Notifier<bool> {
   );
 
   /// One-tap demo login used on the sign-in screen.
-  Future<void> demoAs(UserRole role) => _run(() async {
-    final auth = ref.read(authRepositoryProvider);
-    final email = role == UserRole.educator
-        ? 'ada@quizzle.dev'
-        : 'sam@quizzle.dev';
-    try {
-      await auth.signIn(email: email, password: 'password');
-    } on AppFailure {
-      await auth.register(
-        name: role == UserRole.educator ? 'Demo Educator' : 'Demo Student',
-        email: email,
-        password: 'password',
-        role: role,
-      );
-    }
-  });
+  ///
+  /// Delegates to the repository, whose backends genuinely differ: the server
+  /// signs in (or registers) a demo account, while the offline backend hands
+  /// over a local profile with no credential at all. Doing sign-in-then-
+  /// register here broke the offline demo once its seeded profiles existed:
+  /// they have no stored password, so sign-in and registration both failed.
+  Future<void> demoAs(UserRole role) =>
+      _run(() => ref.read(authRepositoryProvider).demoSignIn(role));
 
   Future<void> signOut() => _run(ref.read(authRepositoryProvider).signOut);
 }
@@ -177,7 +169,7 @@ final sessionHostControllerProvider = Provider.autoDispose
 // ---------------------------------------------------------------------------
 
 final contentExtractorProvider = Provider<ContentExtractor>(
-  (ref) => const ContentExtractor(),
+  (ref) => ContentExtractor(ref.watch(contentRepositoryProvider)),
 );
 
 /// Convenience for "go live from this quiz".

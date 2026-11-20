@@ -97,6 +97,7 @@ export const sessionJson = (s) => ({
   started_at: iso(s.started_at),
   ended_at: iso(s.ended_at),
   allow_late_join: s.allow_late_join,
+  revealed_at: iso(s.revealed_at),
   scoring: { base_points: s.base_points, speed_bonus_max: s.speed_bonus_max },
   created_at: iso(s.created_at),
 });
@@ -128,5 +129,18 @@ export const responseJson = (r) => ({
   is_correct: r.is_correct,
   response_time_ms: r.response_time_ms,
   points_awarded: r.points_awarded,
+  answered_at: iso(r.answered_at),
+});
+
+/**
+ * A player's own outcome for one question. Only ever built for a question that
+ * has been revealed — it carries correctness, which is part of the key.
+ */
+export const answerResultJson = (r) => ({
+  question_index: r.question_index,
+  selected_index: r.selected_index,
+  is_correct: r.is_correct,
+  points_awarded: r.points_awarded,
+  response_time_ms: r.response_time_ms,
   answered_at: iso(r.answered_at),
 });

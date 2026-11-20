@@ -67,23 +67,45 @@ themeModeControllerProvider     NotifierProvider<ThemeModeController, ThemeMode>
   .setDark(bool)
 ```
 
-## New providers the data-layer agent MUST add (screens will use them)
+## Realtime providers (landed after the second audit)
+
+These were specified here from the start but never added; the screens carried stand-ins that
+could not work (a banner that never saw a dropped socket, a counter stuck at 0).
 
 ```dart
-// Connection state for the reconnect banner. The old app had no such UI and the
-// spec requires a clear reconnect state during a live quiz.
+// Connection state for the reconnect banner, straight from the realtime client.
 connectionStateProvider      StreamProvider<ConnectionState>
   // enum ConnectionState { connected, reconnecting, offline }
 
 // Live answered-count during 'asking', pushed as a coalesced delta by the server
 // (docs/API.md `answer.count`). Host screen shows "n / m answered".
 answerCountProvider          StreamProvider.family<({int answered, int total}), String /*sessionId*/>
+
+// The current question's key + distribution once revealed, null while asking
+// (`question.revealed`). The only source of the key on a student device.
+revealProvider               StreamProvider.family<RevealInfo?, String /*sessionId*/>
+
+// This player's own results by question index, revealed questions only
+// (`answer.result`). The answer response carries no correctness before reveal.
+myResultsProvider            StreamProvider.family<Map<int, AnswerResult>, String /*sessionId*/>
+
+// Server time estimated on this device. Every countdown passes `clock.now`.
+serverClockProvider          Provider<ServerClock>
 ```
+
+Repository additions behind them: `SessionRepository.watchReveal` / `watchMyResults`,
+`QuizRepository.gradePractice`, `Backend.clock` / `Backend.resumeRealtime()`.
 
 ## Rules
 
 - `publicQuestionProvider` must keep returning a **redacted** question until reveal.
-  Screens must never receive `correct_index` early. Do not "optimise" this away.
+  Screens must never receive `correct_index` early. Do not "optimise" this away. A screen
+  shows the key by applying `revealProvider`'s value for the *same* question index — never by
+  refetching and never by indexing options with a `correct_index` of `-1`.
+- `questionsProvider` carries the key for the quiz's owner only; practice asks
+  `gradePractice` for each answer.
+- Countdowns read `serverClockProvider`, never `DateTime.now()` directly. With the networked
+  backend a host screen must not reveal on its own countdown; the server does.
 - Screens must not call `sessionQuestionsProvider` on a student route — it is host-only
   and the server will 403/404.
 - No polling from the client. Realtime comes from the WebSocket deltas.

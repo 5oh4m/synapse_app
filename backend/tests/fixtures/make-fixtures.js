@@ -8,9 +8,10 @@
 //    A regex over the raw bytes cannot find it, because the XML is deflated.
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import JSZip from 'jszip';
 
-export const FIXTURES_DIR = path.dirname(new URL(import.meta.url).pathname);
+export const FIXTURES_DIR = path.dirname(fileURLToPath(import.meta.url));
 
 const PAGE_TEXT = [
   'Photosynthesis converts light energy into chemical energy stored in glucose.',
@@ -219,7 +220,7 @@ export async function ensureFixtures() {
   return { pdfPath, pptxPath };
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
   const out = await ensureFixtures();
   console.log(out);
 }

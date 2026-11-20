@@ -1,10 +1,11 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import '../ai/anthropic_quiz_generator.dart';
 import '../ai/mock_quiz_generator.dart';
 import '../ai/quiz_generator.dart';
 import '../ai/remote_quiz_generator.dart';
+import '../core/connection.dart' as net;
 import '../core/env.dart';
+import '../core/server_clock.dart';
 import '../data/in_memory/in_memory_backend.dart';
 import '../data/remote/remote_backend.dart';
 import '../data/repositories.dart';
@@ -14,6 +15,7 @@ import '../models/question.dart';
 import '../models/quiz.dart';
 import '../models/quiz_session.dart';
 import '../models/response.dart';
+import '../models/reveal.dart';
 import '../models/session_participant.dart';
 import '../models/user.dart';
 
@@ -30,15 +32,18 @@ final backendReadyProvider = FutureProvider<Backend>((ref) async {
 });
 
 final quizGeneratorProvider = Provider<QuizGenerator>((ref) {
-  if (Env.isRemote) return RemoteQuizGenerator();
-  if (Env.useAnthropicDirect) return AnthropicQuizGenerator();
+  if (Env.isRemote) {
+    final backend = ref.watch(backendProvider);
+    if (backend is RemoteBackend) {
+      return RemoteQuizGenerator(backend.api);
+    }
+  }
   return MockQuizGenerator();
 });
 
 /// Human-readable label for the "how are questions generated" banner.
 final generatorLabelProvider = Provider<String>((ref) {
   if (Env.isRemote) return 'Server (${Env.aiProvider})';
-  if (Env.useAnthropicDirect) return 'Claude (${Env.anthropicModel}) — dev';
   return 'Offline sample generator';
 });
 
@@ -167,12 +172,44 @@ final sessionQuestionsProvider = FutureProvider.autoDispose
 
 typedef PublicQuestionArg = ({String sessionId, int index});
 
-/// Answer-key-stripped question for the student device. Re-fetches when the
-/// session doc changes (new index or reveal) because the family key changes
-/// and callers also invalidate on phase change.
+/// Answer-key-stripped question for the student device, fetched once per
+/// index. It stays redacted: the key arrives through [revealProvider], so a
+/// reveal never refetches (and never renders a redacted question as revealed).
 final publicQuestionProvider = FutureProvider.autoDispose
     .family<Question?, PublicQuestionArg>((ref, arg) {
       return ref
           .watch(sessionRepositoryProvider)
           .publicQuestionAt(arg.sessionId, arg.index);
     });
+
+// --- realtime (docs/STATE_CONTRACT.md) ------------------------------------
+
+/// Link state for the reconnect banner, straight from the realtime client.
+final connectionStateProvider = StreamProvider<net.ConnectionState>((ref) {
+  return ref.watch(backendProvider).connectionState();
+});
+
+/// Live "n / m answered" during `asking`, from the coalesced `answer.count`.
+final answerCountProvider = StreamProvider.autoDispose
+    .family<({int answered, int total}), String>((ref, sessionId) {
+      return ref.watch(sessionRepositoryProvider).watchAnswerCount(sessionId);
+    });
+
+/// The current question's key and distribution once revealed; null while it
+/// is being asked.
+final revealProvider = StreamProvider.autoDispose
+    .family<RevealInfo?, String>((ref, sessionId) {
+      return ref.watch(sessionRepositoryProvider).watchReveal(sessionId);
+    });
+
+/// This player's own results, by question index, for revealed questions only.
+final myResultsProvider = StreamProvider.autoDispose
+    .family<Map<int, AnswerResult>, String>((ref, sessionId) {
+      return ref.watch(sessionRepositoryProvider).watchMyResults(sessionId);
+    });
+
+/// Server time as estimated on this device. Countdowns read it, never the
+/// local clock directly.
+final serverClockProvider = Provider<ServerClock>((ref) {
+  return ref.watch(backendProvider).clock;
+});

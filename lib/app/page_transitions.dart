@@ -110,6 +110,18 @@ class PlaneSlideTransition extends StatelessWidget {
             fit: StackFit.passthrough,
             children: [
               child!,
+              // The covered page dims as it recedes, so the two planes read as
+              // stacked sheets. Present only while a page is on top of it.
+              if (x > 0.01)
+                Positioned.fill(
+                  child: IgnorePointer(
+                    child: ColoredBox(
+                      color: Theme.of(
+                        context,
+                      ).colorScheme.scrim.withValues(alpha: 0.12 * x),
+                    ),
+                  ),
+                ),
               // The hard leading edge. Only present while travelling, so it
               // never paints over a settled page.
               if (edgeAlpha > 0.01)

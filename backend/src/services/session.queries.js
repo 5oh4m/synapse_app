@@ -5,10 +5,47 @@ import { one, many } from '../db/pool.js';
 export const SESSION_COLS = `
   id, quiz_id, host_id, quiz_title, join_code, status, current_question_index,
   total_questions, phase, question_started_at, question_ends_at, started_at,
-  ended_at, allow_late_join, base_points, speed_bonus_max, created_at`;
+  ended_at, allow_late_join, base_points, speed_bonus_max, created_at, revealed_at`;
 
 export const getSession = (id) =>
   one(`SELECT ${SESSION_COLS} FROM quiz_sessions WHERE id = $1`, [id]);
+
+/**
+ * Whether question `index` of `session` has had its answer made public. The
+ * single definition every student-facing read uses, so the rule cannot drift
+ * between the question route, the answer route and the results route.
+ */
+export const isRevealed = (session, index) =>
+  session.status === 'ended' ||
+  index < session.current_question_index ||
+  (index === session.current_question_index && session.phase === 'revealing');
+
+/** A participant's own answer to one question, or null. */
+export const myResponse = (participantId, questionIndex) =>
+  one(
+    `SELECT question_index, selected_index, is_correct, points_awarded, response_time_ms, answered_at
+       FROM responses WHERE participant_id = $1 AND question_index = $2`,
+    [participantId, questionIndex],
+  );
+
+/** Every player's answer to one question, keyed for per-user reveal frames. */
+export const answersForQuestion = (sessionId, questionIndex) =>
+  many(
+    `SELECT p.user_id, p.id AS participant_id, r.question_index, r.selected_index,
+            r.is_correct, r.points_awarded, r.response_time_ms, r.answered_at
+       FROM responses r JOIN session_participants p ON p.id = r.participant_id
+      WHERE r.session_id = $1 AND r.question_index = $2`,
+    [sessionId, questionIndex],
+  );
+
+/** Server-derived presence. Returns the row only when the value changed. */
+export const setPresence = (participantId, connected) =>
+  one(
+    `UPDATE session_participants SET connected = $2
+      WHERE id = $1 AND connected IS DISTINCT FROM $2
+      RETURNING id, session_id, connected`,
+    [participantId, connected],
+  );
 
 export const getSessionByCode = (code) =>
   one(`SELECT ${SESSION_COLS} FROM quiz_sessions WHERE join_code = $1`, [String(code).toUpperCase()]);

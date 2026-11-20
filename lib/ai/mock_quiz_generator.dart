@@ -9,8 +9,8 @@ import 'quiz_generator.dart';
 /// Offline generator used when no AI provider is configured (the default).
 /// It builds fill-in-the-blank and true-statement questions from the extracted
 /// text so the whole flow — generate, review, edit, play — works with zero
-/// setup and no network. Swap in [AnthropicQuizGenerator] or the backend's
-/// generator for real questions.
+/// setup and no network. `BACKEND=remote` swaps in the server's generator
+/// (`POST /generate`), which is where real model calls happen.
 class MockQuizGenerator implements QuizGenerator {
   MockQuizGenerator([Random? random]) : _rng = random ?? Random(42);
 
@@ -120,10 +120,11 @@ class MockQuizGenerator implements QuizGenerator {
     required int orderIndex,
     required Difficulty difficulty,
     List<String> avoid = const [],
+    String? questionId,
   }) async {
     await Future<void>.delayed(const Duration(milliseconds: 250));
     final sentences = _sentences(request.sourceText);
-    return _buildOne(
+    final built = _buildOne(
       quizId: quizId,
       orderIndex: orderIndex,
       difficulty: difficulty,
@@ -131,6 +132,8 @@ class MockQuizGenerator implements QuizGenerator {
       subject: request.subject.isNotEmpty ? request.subject : request.title,
       usedStems: avoid.toSet(),
     );
+    // Keeping the id is what makes this a replacement rather than a duplicate.
+    return questionId == null ? built : built.withId(questionId);
   }
 
   Question _buildOne({

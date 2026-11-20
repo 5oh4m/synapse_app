@@ -48,3 +48,29 @@ running agent's environment):
 
 Note: `flutter analyze` crashes on this machine on **both** SDKs (broken
 `analysis_server.dart.snapshot` in the cache). Use `dart analyze lib test`.
+
+## Done (15 Sep 2026)
+
+Pinned to **3.47.3**: `environment.flutter: ">=3.47.0"` in `pubspec.yaml`, and
+`onReorder` → `onReorderItem` in the question review screen (the new callback already
+adjusts `newIndex` for the removed item, so the manual `-1` is gone). `dart analyze lib test`
+reports no issues and `flutter test` passes on 3.47.3. The answer tiles use
+`NoSplash.splashFactory`; the global theme still uses `InkRipple`.
+
+## If `flutter` fails with "You have not agreed to the Xcode license"
+
+The `flutter` launcher calls `git`, and the native-asset hook of `objective_c` calls
+`xcrun`; both go through Xcode and stop until its license is accepted. The permanent fix is
+`sudo xcodebuild -license accept`. Without admin rights, point both at the Command Line Tools
+for one command:
+
+```sh
+mkdir -p /tmp/clt-bin
+printf '#!/bin/sh\nexport DEVELOPER_DIR=/Library/Developer/CommandLineTools\nexec /usr/bin/xcrun "$@"\n' > /tmp/clt-bin/xcrun
+printf '#!/bin/sh\nexport DEVELOPER_DIR=/Library/Developer/CommandLineTools\nexec /usr/bin/git "$@"\n' > /tmp/clt-bin/git
+chmod +x /tmp/clt-bin/*
+PATH=/tmp/clt-bin:$PATH flutter test
+```
+
+The wrapper is needed for `xcrun` because build hooks run with a filtered environment that
+drops `DEVELOPER_DIR`.

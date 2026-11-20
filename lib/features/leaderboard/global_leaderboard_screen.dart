@@ -32,7 +32,8 @@ class _State extends ConsumerState<GlobalLeaderboardScreen> {
           children: [
             SegmentedButton<String>(
               segments: const [
-                ButtonSegment(value: 'weekly', label: Text('This week')),
+                // Must match the API's period values: week | month | all-time.
+                ButtonSegment(value: 'week', label: Text('This week')),
                 ButtonSegment(value: 'all-time', label: Text('All time')),
               ],
               selected: {_period},

@@ -49,7 +49,12 @@ class AnswerTile extends StatefulWidget {
     this.enabled = true,
     this.focusNode,
     this.autofocus = false,
+    this.receded = false,
   });
+
+  /// Another option has been locked in: this one desaturates and steps back
+  /// (DESIGN.md motion 4). Visual only — the label does not change.
+  final bool receded;
 
   /// 0-based option index. Drives the letter, the shape and the fill.
   final int index;
@@ -183,51 +188,63 @@ class _AnswerTileState extends State<AnswerTile> {
     );
 
     // Correct wipes from the left; wrong cross-fades; everything else is flat.
-    Widget plane;
-    switch (widget.status) {
-      case AnswerTileStatus.correct:
-        plane = WipeReveal(
-          revealed: true,
-          duration: durSlow,
-          overlay: contentFor(t.correct),
-          child: contentFor(base),
-        );
-      case AnswerTileStatus.wrong:
-        plane = _CrossFadeFill(from: base, to: t.wrong, builder: contentFor);
-      case AnswerTileStatus.idle:
-      case AnswerTileStatus.locked:
-      case AnswerTileStatus.dimmed:
-        plane = contentFor(base);
-    }
+    //
+    // The tree below is the same shape in every status. Implicit animations
+    // only run when an existing element sees its target change: this used to
+    // build a fresh WipeReveal (and drop the InkWell and scale wrappers) at the
+    // moment of reveal, so the correct tile was born fully wiped and the wipe
+    // never played. Now the WipeReveal, the desaturation and the tap wrappers
+    // are always present and simply change their targets.
+    final interactive = _interactive;
+    final Widget basePlane = widget.status == AnswerTileStatus.wrong
+        ? _CrossFadeFill(from: base, to: t.wrong, builder: contentFor)
+        : contentFor(base);
 
-    // The unchosen tiles desaturate once the answer is out.
-    if (widget.status == AnswerTileStatus.dimmed) {
-      plane = _Desaturate(amount: 1, child: plane);
-    }
+    Widget plane = WipeReveal(
+      revealed: widget.status == AnswerTileStatus.correct,
+      duration: durSlow,
+      overlay: contentFor(t.correct),
+      child: basePlane,
+    );
 
-    if (_interactive) {
-      plane = Material(
-        color: const Color(0x00000000),
-        child: InkWell(
-          onTap: widget.onPressed,
-          onTapDown: (_) => setState(() => _pressed = true),
-          onTapUp: (_) => setState(() => _pressed = false),
-          onTapCancel: () => setState(() => _pressed = false),
-          onFocusChange: (v) => setState(() => _focused = v),
-          focusNode: widget.focusNode,
-          autofocus: widget.autofocus,
-          focusColor: const Color(0x00000000),
-          borderRadius: QuizzleTokens.radius,
-          child: plane,
-        ),
-      );
-      plane = AnimatedScale(
-        scale: _pressed ? t.pressScale : 1.0,
-        duration: Motion.dur(context, durInstant),
-        curve: easeSnap,
+    // Unchosen tiles step back: part way when another option is locked in,
+    // fully once the answer is out.
+    plane = _Desaturate(
+      amount: widget.status == AnswerTileStatus.dimmed
+          ? 1
+          : widget.receded
+          ? 0.7
+          : 0,
+      child: plane,
+    );
+
+    plane = Material(
+      color: const Color(0x00000000),
+      child: InkWell(
+        onTap: interactive ? widget.onPressed : null,
+        onTapDown: interactive
+            ? (_) => setState(() => _pressed = true)
+            : null,
+        onTapUp: interactive ? (_) => setState(() => _pressed = false) : null,
+        onTapCancel: interactive
+            ? () => setState(() => _pressed = false)
+            : null,
+        onFocusChange: (v) => setState(() => _focused = v),
+        canRequestFocus: interactive,
+        focusNode: widget.focusNode,
+        autofocus: widget.autofocus && interactive,
+        focusColor: const Color(0x00000000),
+        splashFactory: NoSplash.splashFactory,
+        borderRadius: QuizzleTokens.radius,
         child: plane,
-      );
-    }
+      ),
+    );
+    plane = AnimatedScale(
+      scale: interactive && _pressed ? t.pressScale : 1.0,
+      duration: Motion.dur(context, durInstant),
+      curve: easeSnap,
+      child: plane,
+    );
 
     // Lock-in: the 4px navy block-print offset. Space is always reserved so
     // locking in never reflows the grid.
@@ -408,7 +425,11 @@ class AnswerTileGrid extends StatelessWidget {
     this.stagger = true,
     this.columns,
     this.spacing = 12,
+    this.lockedIn = false,
   });
+
+  /// The player has submitted [selectedIndex]: the other tiles recede.
+  final bool lockedIn;
 
   final List<String> options;
 
@@ -443,9 +464,20 @@ class AnswerTileGrid extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final width = MediaQuery.sizeOf(context).width;
-    final cols = columns ?? (width < 600 ? 1 : 2);
+    // Columns follow the grid's own box, not the window: inside the host's
+    // split projector layout a wide window can still give the grid a narrow
+    // column.
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final width = constraints.hasBoundedWidth
+            ? constraints.maxWidth
+            : MediaQuery.sizeOf(context).width;
+        return _grid(columns ?? (width < 560 ? 1 : 2));
+      },
+    );
+  }
 
+  Widget _grid(int cols) {
     final tiles = <Widget>[
       for (var i = 0; i < options.length; i++)
         AnswerTile(
@@ -455,6 +487,11 @@ class AnswerTileGrid extends StatelessWidget {
           count: counts != null && i < counts!.length ? counts![i] : null,
           showCount: showCounts,
           enabled: enabled && correctIndex == null,
+          receded:
+              lockedIn &&
+              correctIndex == null &&
+              selectedIndex != null &&
+              selectedIndex != i,
           onPressed: onSelect == null ? null : () => onSelect!(i),
         ),
     ];

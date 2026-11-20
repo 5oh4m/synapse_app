@@ -30,11 +30,17 @@ export const requireRole = (...roles) => (req, _res, next) => {
   return next();
 };
 
-/** For the WS upgrade, which has no Express req. */
+/** For the WS upgrade and the rate limiter, which have no `req.user`. */
 export function userFromToken(token) {
   try {
     const claims = verifyAccessToken(token);
-    return { sub: claims.sub, role: claims.role, email: claims.email, name: claims.name };
+    return {
+      sub: claims.sub,
+      role: claims.role,
+      email: claims.email,
+      name: claims.name,
+      exp: claims.exp,
+    };
   } catch {
     return null;
   }

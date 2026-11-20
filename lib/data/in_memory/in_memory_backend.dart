@@ -1,28 +1,49 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 
-import 'package:shared_preferences/shared_preferences.dart';
+import 'package:crypto/crypto.dart';
 
+import '../../ai/mock_quiz_generator.dart';
+import '../../ai/quiz_generator.dart';
+import '../../core/connection.dart';
 import '../../core/failure.dart';
 import '../../core/ids.dart';
+import '../../core/server_clock.dart';
 import '../../models/content_item.dart';
 import '../../models/enums.dart';
+import '../../models/extracted_content.dart';
 import '../../models/leaderboard_entry.dart';
 import '../../models/question.dart';
 import '../../models/quiz.dart';
 import '../../models/quiz_session.dart';
 import '../../models/response.dart';
+import '../../models/reveal.dart';
 import '../../models/scoring.dart';
 import '../../models/session_participant.dart';
 import '../../models/user.dart';
+import '../local/key_value_store.dart';
 import '../repositories.dart';
 
-/// Zero-setup backend: everything lives in memory in one isolate. Perfect for
-/// running the full flow on one device and for tests. Live sessions only sync
-/// between host and students inside the *same* running app instance — use the
-/// `remote` backend (bundled Node server) for real multi-device play.
+/// Offline backend: one isolate, no network, no setup.
+///
+/// **What it is.** The store for the unit tests and a single-device demo of the
+/// whole flow — register, generate, review, host, play, score.
+///
+/// **What it is not.** Multi-device. A host and a student in this backend are
+/// the same running app; two browser tabs do not see each other. Real
+/// classroom play needs `--dart-define=BACKEND=remote` and the server in
+/// `backend/` ([RemoteBackend]). [isMultiDevice] returns false so the UI can
+/// say so rather than implying otherwise.
+///
+/// **Credentials are never written to disk.** The previous version kept an
+/// `email -> plaintext password` map and serialised it into
+/// `shared_preferences` (localStorage on web). That key is now actively deleted
+/// on first run (see [_Db._purgeLeakedV1Store]).
 class InMemoryBackend implements Backend {
-  InMemoryBackend() {
+  InMemoryBackend({KeyValueStore? store, bool seedDemoData = true})
+    : _db = _Db(store ?? SharedPreferencesStore()),
+      _seedDemoData = seedDemoData {
     _auth = _Auth(_db);
     _content = _Content(_db);
     _quizzes = _Quizzes(_db);
@@ -31,13 +52,15 @@ class InMemoryBackend implements Backend {
     _analytics = _Analytics(_db);
   }
 
-  final _Db _db = _Db();
+  final _Db _db;
+  final bool _seedDemoData;
   late final _Auth _auth;
   late final _Content _content;
   late final _Quizzes _quizzes;
   late final _Sessions _sessions;
   late final _Leaderboard _leaderboard;
   late final _Analytics _analytics;
+  final _generator = MockQuizGenerator();
 
   @override
   AuthRepository get auth => _auth;
@@ -51,187 +74,354 @@ class InMemoryBackend implements Backend {
   LeaderboardRepository get leaderboard => _leaderboard;
   @override
   AnalyticsRepository get analytics => _analytics;
+  @override
+  QuizGenerator get generator => _generator;
+
+  @override
+  String get generatorLabel => 'Offline sample generator';
+
+  @override
+  bool get isMultiDevice => false;
+
+  /// No socket, so no reconnect states to report. It says `connected` because
+  /// the store is in this isolate and always reachable — not to imply a network.
+  @override
+  Stream<ConnectionState> connectionState() =>
+      Stream.value(ConnectionState.connected);
+
+  /// The session clock is this device's clock, so there is no offset to learn.
+  @override
+  final ServerClock clock = ServerClock();
+
+  @override
+  void resumeRealtime() {}
+
+  @override
+  Stream<AppFailure> storageIssues() => _db.issues;
 
   @override
   Future<void> init() async {
-    final restored = await _db.tryRestore();
-    if (!restored) {
+    final restored = await _db.restore();
+    if (!restored && _seedDemoData) {
       _db.seedDemo();
-      await _db.persistNow();
+      await _db.flush();
     }
   }
+
+  @override
+  Future<void> dispose() async {
+    await _db.dispose();
+  }
+
+  /// Waits for any debounced write to land. Tests use this instead of sleeping.
+  Future<void> flush() => _db.flush();
 }
 
 // ---------------------------------------------------------------------------
 // Shared store
 // ---------------------------------------------------------------------------
 
+/// The collections that are persisted, each under its own key.
+///
+/// Live-session state (sessions, participants, responses) is deliberately
+/// absent: it churns on every answer and is meaningless after a restart. The
+/// durable summary of a finished session is one [_Played] record per player.
+enum _Col { users, content, quizzes, questions, results, session }
+
 class _Db {
+  _Db(this.store);
+
+  final KeyValueStore store;
+
+  static const _prefix = 'quizzle.v2';
+  static const _legacyKey = 'quizzle.store.v1';
+
+  static String _key(_Col col) => '$_prefix.${col.name}';
+
+  /// Bulky extracted text lives one key per item, so a quiz edit never
+  /// rewrites a megabyte of lecture notes.
+  static String _textKey(String id) => '$_prefix.text.$id';
+
   final Map<String, AppUser> users = {};
-  final Map<String, String> passwords = {}; // email -> password (mock only)
+
+  /// email -> salted hash. **RAM only.** Never serialised; see the class doc.
+  final Map<String, String> _credentials = {};
+
   AppUser? currentUser;
 
   final Map<String, ContentItem> content = {};
   final Map<String, Quiz> quizzes = {};
   final Map<String, Question> questions = {};
+
+  // Ephemeral.
   final Map<String, QuizSession> sessions = {};
   final Map<String, SessionParticipant> participants = {};
   final Map<String, QuizResponse> responses = {};
+  final Map<String, List<Question>> sessionQuestions = {};
 
-  /// studentId -> cumulative record
-  final Map<String, _Cum> cumulative = {};
+  /// Durable per-player result of a finished session. Enough to filter the
+  /// leaderboard by period and subject for real.
+  final List<_Played> results = [];
 
   final _authCtrl = StreamController<AppUser?>.broadcast();
   final _bus = StreamController<String>.broadcast();
+  final _issuesCtrl = StreamController<AppFailure>.broadcast();
 
   Stream<AppUser?> get authStream => _authCtrl.stream;
+
+  /// Storage failures, surfaced instead of swallowed.
+  Stream<AppFailure> get issues => _issuesCtrl.stream;
+
+  final Set<_Col> _dirty = {};
+  final Set<String> _dirtyText = {};
+  Timer? _timer;
+  Completer<void>? _pending;
+  int _consecutiveFailures = 0;
+  bool seeded = false;
+
+  // ------------------------------------------------------------ mutations ---
 
   void setUser(AppUser? u) {
     currentUser = u;
     _authCtrl.add(u);
-    schedulePersist();
+    touch(_Col.session);
   }
 
-  void ping(String channel) {
-    _bus.add(channel);
-    schedulePersist();
+  void setCredential(String email, String password) {
+    _credentials[email] = _hash(email, password);
   }
 
-  // -------------------------------------------------------------------
-  // Persistence: every registered account, uploaded quiz and score survives
-  // a page reload / app restart. Stored as one JSON blob via
-  // shared_preferences (localStorage on web, a local file elsewhere) — this
-  // is a dev/demo backend, not a substitute for a real database, but it means
-  // "register, then come back later" actually works.
-  // -------------------------------------------------------------------
-  static const _storeKey = 'quizzle.store.v1';
-  Timer? _persistTimer;
+  bool hasCredential(String email) => _credentials.containsKey(email);
 
-  /// Debounced so a burst of pings (e.g. answers landing during a live
-  /// question) doesn't write on every single one.
-  void schedulePersist() {
-    _persistTimer?.cancel();
-    _persistTimer = Timer(const Duration(milliseconds: 300), persistNow);
+  bool checkCredential(String email, String password) =>
+      _credentials[email] == _hash(email, password);
+
+  /// Salted with the address so two accounts sharing a password do not share a
+  /// digest. Demo-grade and RAM-only — the server uses bcrypt.
+  String _hash(String email, String password) =>
+      base64Url.encode(sha256.convert(utf8.encode('$email::$password')).bytes);
+
+  /// Notifies watchers. Unlike the previous version this does **not** trigger a
+  /// write: persistence is requested explicitly by [touch], so a live session's
+  /// answer storm costs zero storage writes.
+  void ping(String channel) => _bus.add(channel);
+
+  /// Marks one collection as needing a write.
+  void touch(_Col col) {
+    _dirty.add(col);
+    _schedule();
   }
 
-  Future<void> persistNow() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setString(_storeKey, jsonEncode(_snapshot()));
-    } catch (_) {
-      // Storage unavailable (private browsing, disabled cookies, ...) — the
-      // app still works for the current session, it just won't be
-      // remembered next time.
+  /// Marks one content item's extracted text as needing a write.
+  void touchText(String id) {
+    _dirtyText.add(id);
+    _schedule();
+  }
+
+  void _schedule() {
+    if (_consecutiveFailures >= 3) return;
+    _timer?.cancel();
+    _timer = Timer(const Duration(milliseconds: 250), () {
+      unawaited(flush());
+    });
+  }
+
+  /// Writes only what changed. Returns when the write attempt is finished.
+  Future<void> flush() async {
+    _timer?.cancel();
+    _timer = null;
+    if (_pending != null) return _pending!.future;
+    if (_dirty.isEmpty && _dirtyText.isEmpty) return;
+
+    final completer = Completer<void>();
+    _pending = completer;
+
+    final cols = _dirty.toList();
+    final texts = _dirtyText.toList();
+    _dirty.clear();
+    _dirtyText.clear();
+
+    var failed = false;
+    for (final col in cols) {
+      failed = !await _writeCollection(col) || failed;
     }
+    for (final id in texts) {
+      final item = content[id];
+      if (item == null) {
+        await store.remove(_textKey(id));
+        continue;
+      }
+      failed = !await _write(_textKey(id), item.extractedText) || failed;
+    }
+
+    _consecutiveFailures = failed ? _consecutiveFailures + 1 : 0;
+    if (_consecutiveFailures == 3) {
+      _report(
+        const AppFailure(
+          'Offline storage keeps rejecting writes, so nothing more will be '
+          'saved this session. Your work stays in this tab only.',
+          code: 'STORAGE',
+        ),
+      );
+    }
+
+    _pending = null;
+    completer.complete();
   }
 
-  /// Returns true if a previous session was found and restored.
-  Future<bool> tryRestore() async {
+  Future<bool> _writeCollection(_Col col) async {
+    final payload = switch (col) {
+      _Col.users => jsonEncode([for (final u in users.values) u.toJson()]),
+      // The index carries metadata only; `extracted_text` is written per item.
+      _Col.content => jsonEncode([
+        for (final c in content.values) c.toJson()..remove('extracted_text'),
+      ]),
+      _Col.quizzes => jsonEncode([for (final q in quizzes.values) q.toJson()]),
+      _Col.questions => jsonEncode([
+        for (final q in questions.values) q.toJson(),
+      ]),
+      _Col.results => jsonEncode([for (final r in results) r.toJson()]),
+      _Col.session => jsonEncode({'current_user_id': currentUser?.id}),
+    };
+    return _write(_key(col), payload);
+  }
+
+  Future<bool> _write(String key, String value) async {
     try {
-      final prefs = await SharedPreferences.getInstance();
-      final raw = prefs.getString(_storeKey);
-      if (raw == null) return false;
-      _hydrate(jsonDecode(raw) as Map<String, dynamic>);
-      seeded = true;
+      await store.write(key, value);
       return true;
-    } catch (_) {
+    } on AppFailure catch (e) {
+      _report(e);
+      return false;
+    } catch (e) {
+      _report(
+        AppFailure(
+          'Could not save to offline storage ($key).',
+          code: 'STORAGE',
+          cause: e,
+        ),
+      );
       return false;
     }
   }
 
-  Map<String, dynamic> _snapshot() => {
-        'users': users.values.map((u) => u.toJson()).toList(),
-        'passwords': passwords,
-        'current_user_id': currentUser?.id,
-        'content': content.values.map((c) => c.toJson()).toList(),
-        'quizzes': quizzes.values.map((q) => q.toJson()).toList(),
-        'questions': questions.values.map((q) => q.toJson()).toList(),
-        'sessions': sessions.values.map((s) => s.toJson()).toList(),
-        'session_questions': sessionQuestionsStore.map(
-          (id, qs) => MapEntry(id, qs.map((q) => q.toJson()).toList()),
+  void _report(AppFailure failure) {
+    if (!_issuesCtrl.isClosed) _issuesCtrl.add(failure);
+  }
+
+  // -------------------------------------------------------------- restore ---
+
+  Future<bool> restore() async {
+    await _purgeLeakedV1Store();
+    final rawUsers = await store.read(_key(_Col.users));
+    if (rawUsers == null) return false;
+    try {
+      for (final raw in (jsonDecode(rawUsers) as List)) {
+        final u = AppUser.fromJson(raw as Map<String, dynamic>);
+        users[u.id] = u;
+      }
+      await _restoreContent();
+      await _restoreList(
+        _Col.quizzes,
+        (m) => quizzes[(m['id'] as String)] = Quiz.fromJson(m),
+      );
+      await _restoreList(
+        _Col.questions,
+        (m) => questions[(m['id'] as String)] = Question.fromJson(m),
+      );
+      final rawResults = await store.read(_key(_Col.results));
+      if (rawResults != null) {
+        for (final raw in (jsonDecode(rawResults) as List)) {
+          results.add(_Played.fromJson(raw as Map<String, dynamic>));
+        }
+      }
+      final rawSession = await store.read(_key(_Col.session));
+      if (rawSession != null) {
+        final id =
+            (jsonDecode(rawSession) as Map<String, dynamic>)['current_user_id']
+                as String?;
+        currentUser = id == null ? null : users[id];
+      }
+      seeded = true;
+      return true;
+    } catch (e) {
+      _report(
+        AppFailure(
+          'Saved offline data could not be read and was ignored.',
+          code: 'STORAGE',
+          cause: e,
         ),
-        'participants': participants.values.map((p) => p.toJson()).toList(),
-        'responses': responses.values.map((r) => r.toJson()).toList(),
-        'cumulative': cumulative.values
-            .map((c) => {
-                  'student_id': c.studentId,
-                  'name': c.name,
-                  'points': c.points,
-                  'quizzes': c.quizzes,
-                  'correct': c.correct,
-                  'answered': c.answered,
-                })
-            .toList(),
-      };
-
-  /// Set by [_Sessions] so a restore can rebuild its question-list cache too;
-  /// avoids a circular dependency between the two classes.
-  final Map<String, List<Question>> sessionQuestionsStore = {};
-
-  void _hydrate(Map<String, dynamic> j) {
-    users.clear();
-    for (final raw in (j['users'] as List? ?? const [])) {
-      final u = AppUser.fromJson(raw as Map<String, dynamic>);
-      users[u.id] = u;
-    }
-    passwords
-      ..clear()
-      ..addAll((j['passwords'] as Map? ?? const {}).map(
-        (k, v) => MapEntry(k as String, v as String),
-      ));
-    final currentId = j['current_user_id'] as String?;
-    currentUser = currentId == null ? null : users[currentId];
-
-    content.clear();
-    for (final raw in (j['content'] as List? ?? const [])) {
-      final c = ContentItem.fromJson(raw as Map<String, dynamic>);
-      content[c.id] = c;
-    }
-    quizzes.clear();
-    for (final raw in (j['quizzes'] as List? ?? const [])) {
-      final q = Quiz.fromJson(raw as Map<String, dynamic>);
-      quizzes[q.id] = q;
-    }
-    questions.clear();
-    for (final raw in (j['questions'] as List? ?? const [])) {
-      final q = Question.fromJson(raw as Map<String, dynamic>);
-      questions[q.id] = q;
-    }
-    sessions.clear();
-    for (final raw in (j['sessions'] as List? ?? const [])) {
-      final s = QuizSession.fromJson(raw as Map<String, dynamic>);
-      sessions[s.id] = s;
-    }
-    sessionQuestionsStore.clear();
-    (j['session_questions'] as Map? ?? const {}).forEach((id, list) {
-      sessionQuestionsStore[id as String] = (list as List)
-          .map((raw) => Question.fromJson(raw as Map<String, dynamic>))
-          .toList();
-    });
-    participants.clear();
-    for (final raw in (j['participants'] as List? ?? const [])) {
-      final p = SessionParticipant.fromJson(raw as Map<String, dynamic>);
-      participants[p.id] = p;
-    }
-    responses.clear();
-    for (final raw in (j['responses'] as List? ?? const [])) {
-      final r = QuizResponse.fromJson(raw as Map<String, dynamic>);
-      responses[r.id] = r;
-    }
-    cumulative.clear();
-    for (final raw in (j['cumulative'] as List? ?? const [])) {
-      final m = raw as Map<String, dynamic>;
-      cumulative[m['student_id'] as String] =
-          _Cum(m['student_id'] as String, m['name'] as String)
-            ..points = (m['points'] ?? 0) as int
-            ..quizzes = (m['quizzes'] ?? 0) as int
-            ..correct = (m['correct'] ?? 0) as int
-            ..answered = (m['answered'] ?? 0) as int;
+      );
+      return false;
     }
   }
 
-  /// Emits [snapshot()] now, then again on every ping whose channel starts with
-  /// one of [channels].
+  Future<void> _restoreList(
+    _Col col,
+    void Function(Map<String, dynamic>) add,
+  ) async {
+    final raw = await store.read(_key(col));
+    if (raw == null) return;
+    for (final row in (jsonDecode(raw) as List)) {
+      add(row as Map<String, dynamic>);
+    }
+  }
+
+  Future<void> _restoreContent() async {
+    final raw = await store.read(_key(_Col.content));
+    if (raw == null) return;
+    for (final row in (jsonDecode(raw) as List)) {
+      final map = row as Map<String, dynamic>;
+      final id = map['id'] as String;
+      map['extracted_text'] = await store.read(_textKey(id)) ?? '';
+      content[id] = ContentItem.fromJson(map);
+    }
+  }
+
+  /// The v1 blob contained `{"passwords": {"a@b.c": "hunter2"}}` in cleartext.
+  /// Anything still holding it gets it deleted — migrating the data would mean
+  /// carrying the leak forward, so only the non-credential parts are kept.
+  Future<void> _purgeLeakedV1Store() async {
+    final legacy = await store.read(_legacyKey);
+    if (legacy == null) return;
+    try {
+      final j = jsonDecode(legacy) as Map<String, dynamic>;
+      for (final raw in (j['users'] as List? ?? const [])) {
+        final u = AppUser.fromJson(raw as Map<String, dynamic>);
+        users[u.id] = u;
+      }
+      for (final raw in (j['quizzes'] as List? ?? const [])) {
+        final q = Quiz.fromJson(raw as Map<String, dynamic>);
+        quizzes[q.id] = q;
+      }
+      for (final raw in (j['questions'] as List? ?? const [])) {
+        final q = Question.fromJson(raw as Map<String, dynamic>);
+        questions[q.id] = q;
+      }
+      for (final raw in (j['content'] as List? ?? const [])) {
+        final c = ContentItem.fromJson(raw as Map<String, dynamic>);
+        content[c.id] = c;
+        _dirtyText.add(c.id);
+      }
+      if (users.isNotEmpty) {
+        seeded = true;
+        _dirty.addAll([
+          _Col.users,
+          _Col.quizzes,
+          _Col.questions,
+          _Col.content,
+        ]);
+      }
+    } catch (_) {
+      // Unreadable legacy blob: drop it anyway.
+    }
+    await store.remove(_legacyKey);
+    if (_dirty.isNotEmpty) await flush();
+  }
+
+  // ---------------------------------------------------------------- watch ---
+
+  /// Emits [snapshot] now, then again on every ping matching [channels].
   Stream<T> watch<T>(List<String> channels, T Function() snapshot) {
     late StreamController<T> ctrl;
     StreamSubscription<String>? sub;
@@ -249,7 +439,15 @@ class _Db {
     return ctrl.stream;
   }
 
-  bool seeded = false;
+  Future<void> dispose() async {
+    _timer?.cancel();
+    await _authCtrl.close();
+    await _bus.close();
+    await _issuesCtrl.close();
+  }
+
+  // ----------------------------------------------------------------- seed ---
+
   void seedDemo() {
     if (seeded) return;
     seeded = true;
@@ -278,7 +476,8 @@ class _Db {
     );
     for (final u in [ada, sam, rio]) {
       users[u.id] = u;
-      passwords[u.email] = 'password';
+      // In RAM for this run only, so the demo accounts can sign in normally.
+      setCredential(u.email, 'password');
     }
 
     final content0 = ContentItem(
@@ -317,113 +516,140 @@ class _Db {
     );
     quizzes[quiz0.id] = quiz0;
 
-    final qs = <Question>[
-      Question(
-        id: 'qq-1',
-        quizId: quiz0.id,
-        text: 'What is the primary function of mitochondria?',
-        options: const [
-          'Protein synthesis',
-          'Energy production (ATP)',
-          'Waste removal',
-          'Cell division',
-        ],
-        correctIndex: 1,
-        explanation: 'Mitochondria generate ATP through aerobic respiration.',
-        difficulty: Difficulty.easy,
-        sourceReference: 'Page 4',
-        orderIndex: 0,
-        timeLimitSeconds: 15,
+    const seedQuestions = <(String, List<String>, int, String)>[
+      (
+        'Which organelle generates most of the ATP in a eukaryotic cell?',
+        ['Mitochondrion', 'Ribosome', 'Golgi apparatus', 'Lysosome'],
+        0,
+        'Mitochondria are the site of aerobic respiration.',
       ),
-      Question(
-        id: 'qq-2',
-        quizId: quiz0.id,
-        text: 'Which cells lack a membrane-bound nucleus?',
-        options: const [
-          'Eukaryotic cells',
-          'Plant cells',
-          'Prokaryotic cells',
-          'Animal cells',
+      (
+        'What distinguishes a prokaryotic cell from a eukaryotic cell?',
+        [
+          'No membrane-bound nucleus',
+          'No cell membrane',
+          'No ribosomes',
+          'No DNA',
         ],
-        correctIndex: 2,
-        explanation: 'Prokaryotes have no membrane-bound nucleus.',
-        difficulty: Difficulty.medium,
-        sourceReference: 'Page 2',
-        orderIndex: 1,
-        timeLimitSeconds: 20,
+        0,
+        'Prokaryotes lack a membrane-bound nucleus.',
       ),
-      Question(
-        id: 'qq-3',
-        quizId: quiz0.id,
-        text: 'The cell membrane is best described as a…',
-        options: const [
-          'Rigid protein wall',
-          'Phospholipid bilayer',
-          'Single layer of sugars',
-          'Strand of DNA',
+      (
+        'Which structure assembles proteins from amino acids?',
+        ['Ribosome', 'Nucleolus', 'Vacuole', 'Centriole'],
+        0,
+        'Ribosomes read mRNA to build proteins.',
+      ),
+      (
+        'The cell membrane is best described as a',
+        [
+          'phospholipid bilayer',
+          'single protein sheet',
+          'rigid cellulose wall',
+          'starch granule',
         ],
-        correctIndex: 1,
-        explanation: 'It is a phospholipid bilayer controlling transport.',
-        difficulty: Difficulty.medium,
-        sourceReference: 'Page 6',
-        orderIndex: 2,
-        timeLimitSeconds: 20,
+        0,
+        'It is a bilayer that regulates transport.',
       ),
-      Question(
-        id: 'qq-4',
-        quizId: quiz0.id,
-        text: 'Ribosomes assemble proteins using which template?',
-        options: const ['Messenger RNA', 'Transfer DNA', 'Lipids', 'ATP'],
-        correctIndex: 0,
-        explanation: 'Ribosomes read mRNA to assemble amino acids.',
-        difficulty: Difficulty.hard,
-        sourceReference: 'Page 7',
-        orderIndex: 3,
-        timeLimitSeconds: 30,
-      ),
-      Question(
-        id: 'qq-5',
-        quizId: quiz0.id,
-        text: 'Which organelle carries out photosynthesis?',
-        options: const [
-          'Mitochondrion',
-          'Nucleus',
-          'Chloroplast',
-          'Golgi apparatus',
-        ],
-        correctIndex: 2,
-        explanation: 'Chloroplasts perform photosynthesis in plant cells.',
-        difficulty: Difficulty.easy,
-        sourceReference: 'Page 9',
-        orderIndex: 4,
-        timeLimitSeconds: 15,
+      (
+        'Photosynthesis in plant cells happens in the',
+        ['chloroplast', 'mitochondrion', 'nucleus', 'peroxisome'],
+        0,
+        'Chloroplasts carry out photosynthesis.',
       ),
     ];
-    for (final q in qs) {
-      questions[q.id] = q;
+
+    for (var i = 0; i < seedQuestions.length; i++) {
+      final (text, options, correct, why) = seedQuestions[i];
+      final shuffled = [...options];
+      final answer = options[correct];
+      shuffled.shuffle();
+      final id = 'q-cell-$i';
+      questions[id] = Question(
+        id: id,
+        quizId: quiz0.id,
+        text: text,
+        options: shuffled,
+        correctIndex: shuffled.indexOf(answer),
+        explanation: why,
+        difficulty: i < 2 ? Difficulty.easy : Difficulty.medium,
+        sourceReference: 'Page ${2 + i}',
+        orderIndex: i,
+        timeLimitSeconds: 20,
+      );
     }
 
-    cumulative[sam.id] = _Cum(sam.id, sam.name)
-      ..points = 4200
-      ..quizzes = 3
-      ..correct = 11
-      ..answered = 15;
-    cumulative[rio.id] = _Cum(rio.id, rio.name)
-      ..points = 3850
-      ..quizzes = 2
-      ..correct = 8
-      ..answered = 10;
+    _dirty.addAll([
+      _Col.users,
+      _Col.content,
+      _Col.quizzes,
+      _Col.questions,
+      _Col.session,
+    ]);
+    _dirtyText.add(content0.id);
   }
 }
 
-class _Cum {
-  _Cum(this.studentId, this.name);
+/// One player's finished-session result. Durable, compact, written once.
+class _Played {
+  _Played({
+    required this.studentId,
+    required this.displayName,
+    required this.sessionId,
+    required this.quizId,
+    required this.quizTitle,
+    required this.subject,
+    required this.points,
+    required this.correct,
+    required this.answered,
+    required this.totalQuestions,
+    required this.rank,
+    required this.playedAt,
+  });
+
   final String studentId;
-  final String name;
-  int points = 0;
-  int quizzes = 0;
-  int correct = 0;
-  int answered = 0;
+  final String displayName;
+  final String sessionId;
+  final String quizId;
+  final String quizTitle;
+  final String subject;
+  final int points;
+  final int correct;
+  final int answered;
+  final int totalQuestions;
+  final int rank;
+  final DateTime playedAt;
+
+  Map<String, dynamic> toJson() => {
+    'student_id': studentId,
+    'display_name': displayName,
+    'session_id': sessionId,
+    'quiz_id': quizId,
+    'quiz_title': quizTitle,
+    'subject': subject,
+    'points': points,
+    'correct': correct,
+    'answered': answered,
+    'total_questions': totalQuestions,
+    'rank': rank,
+    'played_at': playedAt.toIso8601String(),
+  };
+
+  factory _Played.fromJson(Map<String, dynamic> j) => _Played(
+    studentId: j['student_id'] as String,
+    displayName: (j['display_name'] ?? 'Player') as String,
+    sessionId: (j['session_id'] ?? '') as String,
+    quizId: (j['quiz_id'] ?? '') as String,
+    quizTitle: (j['quiz_title'] ?? 'Quiz') as String,
+    subject: (j['subject'] ?? '') as String,
+    points: ((j['points'] ?? 0) as num).toInt(),
+    correct: ((j['correct'] ?? 0) as num).toInt(),
+    answered: ((j['answered'] ?? 0) as num).toInt(),
+    totalQuestions: ((j['total_questions'] ?? 0) as num).toInt(),
+    rank: ((j['rank'] ?? 0) as num).toInt(),
+    playedAt:
+        DateTime.tryParse(j['played_at'] as String? ?? '') ?? DateTime.now(),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -451,11 +677,27 @@ class _Auth implements AuthRepository {
     required UserRole role,
   }) async {
     final e = email.trim().toLowerCase();
-    if (_db.passwords.containsKey(e)) {
-      throw const AppFailure('An account with that email already exists.');
+    if (!e.contains('@')) {
+      throw const AppFailure(
+        'Enter a valid email address.',
+        code: 'VALIDATION',
+        field: 'email',
+      );
     }
-    if (password.length < 6) {
-      throw const AppFailure('Password must be at least 6 characters.');
+    if (_db.users.values.any((u) => u.email == e)) {
+      throw const AppFailure(
+        'An account with that email already exists.',
+        code: 'CONFLICT',
+        field: 'email',
+      );
+    }
+    // Same minimum the server enforces, so the two backends agree.
+    if (password.length < 8) {
+      throw const AppFailure(
+        'Password must be at least 8 characters.',
+        code: 'VALIDATION',
+        field: 'password',
+      );
     }
     final user = AppUser(
       id: newId(),
@@ -465,7 +707,8 @@ class _Auth implements AuthRepository {
       createdAt: DateTime.now(),
     );
     _db.users[user.id] = user;
-    _db.passwords[e] = password;
+    _db.setCredential(e, password);
+    _db.touch(_Col.users);
     _db.setUser(user);
     return user;
   }
@@ -476,11 +719,47 @@ class _Auth implements AuthRepository {
     required String password,
   }) async {
     final e = email.trim().toLowerCase();
-    final stored = _db.passwords[e];
-    if (stored == null || stored != password) {
-      throw const AppFailure('Wrong email or password.');
+    final user = _db.users.values.where((u) => u.email == e).firstOrNull;
+    if (user != null && !_db.hasCredential(e)) {
+      // The profile was restored from storage but its password was not — this
+      // backend keeps no credential on disk, by design.
+      throw const AppFailure(
+        'This offline demo does not store passwords. Use a demo profile, or '
+        'run with --dart-define=BACKEND=remote for real accounts.',
+        code: 'NO_CREDENTIAL',
+        field: 'password',
+      );
     }
-    final user = _db.users.values.firstWhere((u) => u.email == e);
+    if (user == null || !_db.checkCredential(e, password)) {
+      throw const AppFailure(
+        'Wrong email or password.',
+        code: 'UNAUTHORIZED',
+        field: 'password',
+      );
+    }
+    _db.setUser(user);
+    return user;
+  }
+
+  /// No password involved: this backend hands over a local demo profile.
+  @override
+  Future<AppUser> demoSignIn(UserRole role) async {
+    final email = role == UserRole.educator
+        ? 'ada@quizzle.dev'
+        : 'sam@quizzle.dev';
+    var user = _db.users.values.where((u) => u.email == email).firstOrNull;
+    user ??= _db.users.values.where((u) => u.role == role).firstOrNull;
+    if (user == null) {
+      user = AppUser(
+        id: newId(),
+        name: role == UserRole.educator ? 'Demo Educator' : 'Demo Student',
+        email: email,
+        role: role,
+        createdAt: DateTime.now(),
+      );
+      _db.users[user.id] = user;
+      _db.touch(_Col.users);
+    }
     _db.setUser(user);
     return user;
   }
@@ -491,9 +770,12 @@ class _Auth implements AuthRepository {
   @override
   Future<AppUser> updateProfile({String? name}) async {
     final u = _db.currentUser;
-    if (u == null) throw const AppFailure('Not signed in.');
+    if (u == null) {
+      throw const AppFailure('Not signed in.', code: 'UNAUTHORIZED');
+    }
     final updated = u.copyWith(name: name);
     _db.users[u.id] = updated;
+    _db.touch(_Col.users);
     _db.setUser(updated);
     return updated;
   }
@@ -520,13 +802,15 @@ class _Content implements ContentRepository {
   @override
   Future<ContentItem> get(String id) async {
     final c = _db.content[id];
-    if (c == null) throw const AppFailure('Content not found.');
+    if (c == null) {
+      throw const AppFailure('Content not found.', code: 'NOT_FOUND');
+    }
     return c;
   }
 
   @override
   Future<ContentItem> ingest({
-    required String ownerId,
+    String? ownerId,
     required String title,
     String? subject,
     required ContentType sourceType,
@@ -534,42 +818,122 @@ class _Content implements ContentRepository {
     int pageCount = 1,
     String? fileName,
   }) async {
+    final owner = ownerId ?? _db.currentUser?.id;
+    if (owner == null) {
+      throw const AppFailure('Not signed in.', code: 'UNAUTHORIZED');
+    }
     final id = newId();
-    var item = ContentItem(
+    final text = rawText.trim();
+    final usable = text.length >= 40;
+    final item = ContentItem(
       id: id,
-      ownerId: ownerId,
+      ownerId: owner,
       title: title.trim().isEmpty ? (fileName ?? 'Untitled') : title.trim(),
       subject: subject,
       fileType: sourceType,
-      status: ContentStatus.extracting,
+      status: usable ? ContentStatus.ready : ContentStatus.failed,
       fileUrl: fileName,
+      extractedText: usable ? text : '',
+      pageCount: usable ? pageCount : 0,
+      error: usable
+          ? null
+          : 'Only ${text.length} characters of text — paste at least a '
+                'paragraph to generate from.',
       createdAt: DateTime.now(),
     );
     _db.content[id] = item;
-    _db.ping('content');
-
-    await Future<void>.delayed(const Duration(milliseconds: 300));
-    final text = rawText.trim();
-    if (text.length < 40 && sourceType != ContentType.image) {
-      item = item.copyWith(
-        status: ContentStatus.failed,
-        error: 'Could not extract enough text. Paste the text manually.',
-      );
-    } else {
-      item = item.copyWith(
-        status: ContentStatus.ready,
-        extractedText: text,
-        pageCount: pageCount,
-      );
-    }
-    _db.content[id] = item;
+    _db.touch(_Col.content);
+    _db.touchText(id);
     _db.ping('content');
     return item;
+  }
+
+  /// Offline: there is no parser here. Text files are decoded; anything else is
+  /// stored with an honest `needs_text` explanation rather than a fake result.
+  @override
+  Future<ContentItem> upload({
+    required String fileName,
+    required Uint8List bytes,
+    String? title,
+    String? subject,
+  }) async {
+    final extracted = await extractFile(fileName: fileName, bytes: bytes);
+    if (!extracted.isReady) {
+      final id = newId();
+      final owner = _db.currentUser?.id;
+      if (owner == null) {
+        throw const AppFailure('Not signed in.', code: 'UNAUTHORIZED');
+      }
+      final item = ContentItem(
+        id: id,
+        ownerId: owner,
+        title: (title == null || title.isEmpty)
+            ? fileName.replaceAll(RegExp(r'\.[^.]+$'), '')
+            : title,
+        subject: subject,
+        fileType: extracted.sourceType,
+        status: ContentStatus.failed,
+        fileUrl: fileName,
+        error: extracted.message,
+        createdAt: DateTime.now(),
+      );
+      _db.content[id] = item;
+      _db.touch(_Col.content);
+      _db.ping('content');
+      return item;
+    }
+    return ingest(
+      title: (title == null || title.isEmpty)
+          ? fileName.replaceAll(RegExp(r'\.[^.]+$'), '')
+          : title,
+      subject: subject,
+      sourceType: extracted.sourceType,
+      rawText: extracted.text,
+      pageCount: extracted.pageCount,
+      fileName: fileName,
+    );
+  }
+
+  @override
+  Future<ExtractedContent> extractFile({
+    required String fileName,
+    required Uint8List bytes,
+  }) async {
+    final ext = fileName.toLowerCase().split('.').last;
+    if (ext == 'txt' || ext == 'md' || ext == 'csv' || !fileName.contains('.')) {
+      final text = utf8.decode(bytes, allowMalformed: true).trim();
+      return ExtractedContent(
+        text: text,
+        pageCount: text.isEmpty ? 0 : 1,
+        sourceType: ContentType.text,
+        status: text.isEmpty
+            ? ExtractionStatus.needsText
+            : ExtractionStatus.ready,
+        fileName: fileName,
+      );
+    }
+    final type = switch (ext) {
+      'pdf' => ContentType.pdf,
+      'ppt' || 'pptx' => ContentType.pptx,
+      'png' || 'jpg' || 'jpeg' || 'gif' || 'webp' => ContentType.image,
+      _ => ContentType.text,
+    };
+    return ExtractedContent.needsText(
+      sourceType: type,
+      fileName: fileName,
+      message: type == ContentType.image
+          ? 'No OCR is bundled. Paste the text from the image instead.'
+          : 'The offline backend cannot read ${ext.toUpperCase()} files. Start '
+                'the server (cd backend && npm start) and run with '
+                '--dart-define=BACKEND=remote, or paste the text.',
+    );
   }
 
   @override
   Future<void> delete(String id) async {
     _db.content.remove(id);
+    _db.touch(_Col.content);
+    _db.touchText(id);
     _db.ping('content');
   }
 }
@@ -600,6 +964,7 @@ class _Quizzes implements QuizRepository {
     _db.quizzes[quizId] = q.copyWith(
       questionCount: _questionsFor(quizId).length,
     );
+    _db.touch(_Col.quizzes);
   }
 
   @override
@@ -610,31 +975,47 @@ class _Quizzes implements QuizRepository {
   Stream<Quiz?> watchQuiz(String quizId) =>
       _db.watch(['quizzes'], () => _db.quizzes[quizId]);
 
+  /// Mirrors the server: only the owner sees the key.
+  List<Question> _visibleQuestions(String quizId) {
+    final all = _questionsFor(quizId);
+    final owner = _db.quizzes[quizId]?.ownerId;
+    if (owner != null && owner == _db.currentUser?.id) return all;
+    return [
+      for (final q in all) q.copyWith(correctIndex: -1, explanation: ''),
+    ];
+  }
+
   @override
   Stream<List<Question>> watchQuestions(String quizId) =>
-      _db.watch(['questions:$quizId'], () => _questionsFor(quizId));
+      _db.watch(['questions:$quizId'], () => _visibleQuestions(quizId));
 
   @override
   Future<Quiz> get(String quizId) async {
     final q = _db.quizzes[quizId];
-    if (q == null) throw const AppFailure('Quiz not found.');
+    if (q == null) {
+      throw const AppFailure('Quiz not found.', code: 'NOT_FOUND');
+    }
     return q;
   }
 
   @override
   Future<List<Question>> questionsOnce(String quizId) async =>
-      _questionsFor(quizId);
+      _visibleQuestions(quizId);
 
   @override
   Future<Quiz> createDraft({
-    required String ownerId,
+    String? ownerId,
     required String title,
     String? subject,
     String? contentItemId,
   }) async {
+    final owner = ownerId ?? _db.currentUser?.id;
+    if (owner == null) {
+      throw const AppFailure('Not signed in.', code: 'UNAUTHORIZED');
+    }
     final quiz = Quiz(
       id: newId(),
-      ownerId: ownerId,
+      ownerId: owner,
       title: title.trim().isEmpty ? 'Untitled quiz' : title.trim(),
       subject: subject ?? '',
       contentItemId: contentItemId,
@@ -642,6 +1023,7 @@ class _Quizzes implements QuizRepository {
       createdAt: DateTime.now(),
     );
     _db.quizzes[quiz.id] = quiz;
+    _db.touch(_Col.quizzes);
     _db.ping('quizzes');
     return quiz;
   }
@@ -649,28 +1031,35 @@ class _Quizzes implements QuizRepository {
   @override
   Future<void> saveQuiz(Quiz quiz) async {
     _db.quizzes[quiz.id] = quiz;
+    _db.touch(_Col.quizzes);
     _db.ping('quizzes');
   }
 
   @override
   Future<void> publish(String quizId) async {
     final q = _db.quizzes[quizId];
-    if (q == null) throw const AppFailure('Quiz not found.');
+    if (q == null) {
+      throw const AppFailure('Quiz not found.', code: 'NOT_FOUND');
+    }
     final questions = _questionsFor(quizId);
     if (questions.length < 2) {
-      throw const AppFailure('Add at least 2 questions before publishing.');
+      throw const AppFailure(
+        'Add at least 2 questions before publishing.',
+        code: 'CONFLICT',
+      );
     }
-    final bad = questions.firstWhere(
-      (x) => !x.isValid(),
-      orElse: () => questions.first,
-    );
-    if (!bad.isValid()) {
-      throw AppFailure('Question ${bad.orderIndex + 1} is incomplete.');
+    final bad = questions.where((x) => !x.isValid()).firstOrNull;
+    if (bad != null) {
+      throw AppFailure(
+        'Question ${bad.orderIndex + 1} is incomplete.',
+        code: 'CONFLICT',
+      );
     }
     _db.quizzes[quizId] = q.copyWith(
       status: QuizStatus.published,
       questionCount: questions.length,
     );
+    _db.touch(_Col.quizzes);
     _db.ping('quizzes');
   }
 
@@ -679,6 +1068,7 @@ class _Quizzes implements QuizRepository {
     final q = _db.quizzes[quizId];
     if (q == null) return;
     _db.quizzes[quizId] = q.copyWith(status: QuizStatus.draft);
+    _db.touch(_Col.quizzes);
     _db.ping('quizzes');
   }
 
@@ -686,38 +1076,67 @@ class _Quizzes implements QuizRepository {
   Future<void> deleteQuiz(String quizId) async {
     _db.quizzes.remove(quizId);
     _db.questions.removeWhere((_, v) => v.quizId == quizId);
+    _db.touch(_Col.quizzes);
+    _db.touch(_Col.questions);
     _db.ping('quizzes');
     _db.ping('questions:$quizId');
   }
 
   @override
   Future<void> addQuestions(String quizId, List<Question> questions) async {
-    var base = _questionsFor(quizId).length;
+    var next = _questionsFor(quizId).length;
     for (final q in questions) {
       final id = (q.id.isEmpty || q.id.startsWith('tmp')) ? newId() : q.id;
-      _db.questions[id] = Question(
-        id: id,
-        quizId: quizId,
-        text: q.text,
-        options: q.options,
-        correctIndex: q.correctIndex,
-        explanation: q.explanation,
-        difficulty: q.difficulty,
-        sourceReference: q.sourceReference,
-        orderIndex: base,
-        timeLimitSeconds: q.timeLimitSeconds,
-      );
-      base++;
+      _db.questions[id] = q.withId(id, quizId: quizId, orderIndex: next);
+      next++;
     }
     _recount(quizId);
+    _db.touch(_Col.questions);
     _db.ping('questions:$quizId');
     _db.ping('quizzes');
   }
 
+  /// Replace in place. An unknown id falls back to the row holding the same
+  /// `order_index`, which is what stops "Regenerate" from turning 2 questions
+  /// into 3 with two of them claiming index 0.
   @override
   Future<void> saveQuestion(Question question) async {
-    _db.questions[question.id] = question;
-    _db.ping('questions:${question.quizId}');
+    final existing = _db.questions[question.id];
+    if (existing != null) {
+      await replaceQuestion(existing.id, question);
+      return;
+    }
+    final target = _questionsFor(question.quizId)
+        .where((q) => q.orderIndex == question.orderIndex)
+        .firstOrNull;
+    if (target == null) {
+      throw const AppFailure(
+        'That question is no longer part of this quiz.',
+        code: 'NOT_FOUND',
+      );
+    }
+    await replaceQuestion(target.id, question);
+  }
+
+  @override
+  Future<Question> replaceQuestion(
+    String questionId,
+    Question replacement,
+  ) async {
+    final existing = _db.questions[questionId];
+    if (existing == null) {
+      throw const AppFailure('Question not found.', code: 'NOT_FOUND');
+    }
+    // id and order_index survive; everything else is taken from the new one.
+    final saved = replacement.withId(
+      existing.id,
+      quizId: existing.quizId,
+      orderIndex: existing.orderIndex,
+    );
+    _db.questions[existing.id] = saved;
+    _db.touch(_Col.questions);
+    _db.ping('questions:${saved.quizId}');
+    return saved;
   }
 
   @override
@@ -728,6 +1147,7 @@ class _Quizzes implements QuizRepository {
       _db.questions[remaining[i].id] = remaining[i].copyWith(orderIndex: i);
     }
     _recount(quizId);
+    _db.touch(_Col.questions);
     _db.ping('questions:$quizId');
     _db.ping('quizzes');
   }
@@ -738,6 +1158,7 @@ class _Quizzes implements QuizRepository {
       final q = _db.questions[orderedIds[i]];
       if (q != null) _db.questions[q.id] = q.copyWith(orderIndex: i);
     }
+    _db.touch(_Col.questions);
     _db.ping('questions:$quizId');
   }
 
@@ -749,6 +1170,37 @@ class _Quizzes implements QuizRepository {
     l.sort((a, b) => b.createdAt.compareTo(a.createdAt));
     return l;
   }
+
+  @override
+  Future<PracticeGrade> gradePractice({
+    required String quizId,
+    required String questionId,
+    required int selectedIndex,
+  }) async {
+    final quiz = _db.quizzes[quizId];
+    final question = _db.questions[questionId];
+    if (quiz == null || question == null || question.quizId != quizId) {
+      throw const AppFailure('Question not found.', code: 'NOT_FOUND');
+    }
+    final isOwner = quiz.ownerId == _db.currentUser?.id;
+    final live = _db.sessions.values.any(
+      (s) => s.quizId == quizId && s.status != SessionStatus.ended,
+    );
+    if (!isOwner && live) {
+      throw const AppFailure(
+        'This quiz is being played live right now. Practise it once the '
+        'session ends.',
+        code: 'CONFLICT',
+      );
+    }
+    return PracticeGrade(
+      questionId: question.id,
+      selectedIndex: selectedIndex,
+      isCorrect: selectedIndex >= 0 && selectedIndex == question.correctIndex,
+      correctIndex: question.correctIndex,
+      explanation: question.explanation,
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -759,9 +1211,7 @@ class _Sessions implements SessionRepository {
   _Sessions(this._db);
   final _Db _db;
 
-  /// Backed by [_Db.sessionQuestionsStore] so it round-trips through the same
-  /// persistence snapshot as everything else.
-  Map<String, List<Question>> get _sessionQuestions => _db.sessionQuestionsStore;
+  Map<String, List<Question>> get _sessionQuestions => _db.sessionQuestions;
 
   List<SessionParticipant> _participants(String sessionId) {
     final l = _db.participants.values
@@ -781,11 +1231,19 @@ class _Sessions implements SessionRepository {
   @override
   Future<QuizSession> createSession({
     required Quiz quiz,
-    required String hostId,
-    required List<Question> questions,
+    String? hostId,
+    List<Question> questions = const [],
   }) async {
-    if (questions.isEmpty) {
-      throw const AppFailure('This quiz has no questions.');
+    final host = hostId ?? _db.currentUser?.id;
+    if (host == null) {
+      throw const AppFailure('Not signed in.', code: 'UNAUTHORIZED');
+    }
+    final snapshot = questions.isNotEmpty
+        ? List.of(questions)
+        : (_db.questions.values.where((q) => q.quizId == quiz.id).toList()
+            ..sort((a, b) => a.orderIndex.compareTo(b.orderIndex)));
+    if (snapshot.isEmpty) {
+      throw const AppFailure('This quiz has no questions.', code: 'CONFLICT');
     }
     final id = newId();
     var code = newJoinCode();
@@ -798,14 +1256,15 @@ class _Sessions implements SessionRepository {
       id: id,
       quizId: quiz.id,
       quizTitle: quiz.title,
-      hostId: hostId,
+      hostId: host,
       joinCode: code,
       status: SessionStatus.lobby,
-      totalQuestions: questions.length,
+      totalQuestions: snapshot.length,
       createdAt: DateTime.now(),
     );
     _db.sessions[id] = session;
-    _sessionQuestions[id] = List.of(questions);
+    // Snapshot, so editing the quiz mid-session cannot change what is played.
+    _sessionQuestions[id] = snapshot;
     _db.ping('session:$id');
     _db.ping('sessions');
     return session;
@@ -824,68 +1283,139 @@ class _Sessions implements SessionRepository {
       _db.watch(['session:$sessionId'], () => _responses(sessionId));
 
   @override
+  Stream<({int answered, int total})> watchAnswerCount(String sessionId) =>
+      _db.watch(['session:$sessionId'], () {
+        final s = _db.sessions[sessionId];
+        final roster = _participants(sessionId);
+        final index = s?.currentQuestionIndex ?? -1;
+        if (index < 0) return (answered: 0, total: roster.length);
+        final answered = _db.responses.values
+            .where(
+              (r) =>
+                  r.sessionId == sessionId &&
+                  r.questionIndex == index &&
+                  r.selectedIndex >= 0,
+            )
+            .length;
+        return (answered: answered, total: roster.length);
+      });
+
+  @override
   Future<QuizSession?> findByJoinCode(String code) async {
     final norm = normalizeJoinCode(code);
-    try {
-      return _db.sessions.values.firstWhere(
-        (s) => s.joinCode == norm && s.status != SessionStatus.ended,
-      );
-    } catch (_) {
-      return null;
-    }
+    return _db.sessions.values
+        .where((s) => s.joinCode == norm && s.status != SessionStatus.ended)
+        .firstOrNull;
   }
 
   @override
   Future<List<Question>> sessionQuestions(String sessionId) async =>
       List.of(_sessionQuestions[sessionId] ?? const []);
 
+  static bool _isRevealed(QuizSession s, int index) =>
+      s.status == SessionStatus.ended ||
+      index < s.currentQuestionIndex ||
+      (s.currentQuestionIndex == index && s.phase == SessionPhase.revealing);
+
   @override
   Future<Question?> publicQuestionAt(String sessionId, int index) async {
     final qs = _sessionQuestions[sessionId];
     final s = _db.sessions[sessionId];
     if (qs == null || s == null || index < 0 || index >= qs.length) return null;
+    // Never ahead of the class, matching the server.
+    final isHost = _db.currentUser?.id == s.hostId;
+    if (!isHost && (s.isLobby || index > s.currentQuestionIndex)) return null;
     final q = qs[index];
-    final revealed =
-        s.status == SessionStatus.ended ||
-        (s.currentQuestionIndex == index && s.phase == SessionPhase.revealing);
-    if (revealed) return q;
-    // Strip the answer key while the question is live.
+    if (_isRevealed(s, index)) return q;
+    // The answer key never leaves the store while the question is live.
     return q.copyWith(correctIndex: -1, explanation: '');
   }
 
   @override
+  Stream<RevealInfo?> watchReveal(String sessionId) =>
+      _db.watch(['session:$sessionId'], () {
+        final s = _db.sessions[sessionId];
+        final qs = _sessionQuestions[sessionId];
+        if (s == null || qs == null) return null;
+        final index = s.currentQuestionIndex;
+        if (index < 0 || index >= qs.length || s.phase != SessionPhase.revealing) {
+          return null;
+        }
+        final distribution = List<int>.filled(4, 0);
+        for (final r in _db.responses.values) {
+          if (r.sessionId == sessionId &&
+              r.questionIndex == index &&
+              r.selectedIndex >= 0 &&
+              r.selectedIndex < 4) {
+            distribution[r.selectedIndex]++;
+          }
+        }
+        return RevealInfo(
+          questionIndex: index,
+          correctIndex: qs[index].correctIndex,
+          explanation: qs[index].explanation,
+          distribution: distribution,
+        );
+      });
+
+  @override
+  Stream<Map<int, AnswerResult>> watchMyResults(String sessionId) =>
+      _db.watch(['session:$sessionId'], () {
+        final s = _db.sessions[sessionId];
+        final me = _db.currentUser?.id;
+        if (s == null || me == null) return const <int, AnswerResult>{};
+        return {
+          for (final r in _db.responses.values)
+            if (r.sessionId == sessionId &&
+                r.studentId == me &&
+                _isRevealed(s, r.questionIndex))
+              r.questionIndex: AnswerResult(
+                questionIndex: r.questionIndex,
+                selectedIndex: r.selectedIndex,
+                isCorrect: r.isCorrect,
+                pointsAwarded: r.pointsAwarded,
+                responseTimeMs: r.responseTimeMs,
+              ),
+        };
+      });
+
+  @override
   Future<SessionParticipant> joinSession({
     required String joinCode,
-    required AppUser student,
+    AppUser? student,
   }) async {
+    final user = student ?? _db.currentUser;
+    if (user == null) {
+      throw const AppFailure('Not signed in.', code: 'UNAUTHORIZED');
+    }
     final session = await findByJoinCode(joinCode);
     if (session == null) {
-      throw const AppFailure('No live session with that code.');
+      throw const AppFailure(
+        'No live session with that code.',
+        code: 'NOT_FOUND',
+        field: 'join_code',
+      );
     }
-    final existing = _db.participants.values.firstWhere(
-      (p) => p.sessionId == session.id && p.studentId == student.id,
-      orElse: () => SessionParticipant(
-        id: '',
-        sessionId: session.id,
-        studentId: student.id,
-        displayName: student.name,
-        joinedAt: DateTime.fromMillisecondsSinceEpoch(0),
-      ),
-    );
-    if (existing.id.isNotEmpty) {
+    final existing = _db.participants.values
+        .where((p) => p.sessionId == session.id && p.studentId == user.id)
+        .firstOrNull;
+    if (existing != null) {
       final reconnected = existing.copyWith(connected: true);
       _db.participants[existing.id] = reconnected;
       _db.ping('session:${session.id}');
       return reconnected;
     }
     if (!session.isLobby && !session.allowLateJoin) {
-      throw const AppFailure('This session has already started.');
+      throw const AppFailure(
+        'This session has already started.',
+        code: 'CONFLICT',
+      );
     }
     final p = SessionParticipant(
       id: newId(),
       sessionId: session.id,
-      studentId: student.id,
-      displayName: student.name,
+      studentId: user.id,
+      displayName: user.name,
       joinedAt: DateTime.now(),
     );
     _db.participants[p.id] = p;
@@ -896,27 +1426,24 @@ class _Sessions implements SessionRepository {
   @override
   Future<void> setConnected({
     required String sessionId,
-    required String studentId,
+    String? studentId,
     required bool connected,
   }) async {
-    final p = _db.participants.values.firstWhere(
-      (p) => p.sessionId == sessionId && p.studentId == studentId,
-      orElse: () => SessionParticipant(
-        id: '',
-        sessionId: '',
-        studentId: '',
-        displayName: '',
-        joinedAt: DateTime.now(),
-      ),
-    );
-    if (p.id.isEmpty) return;
+    final id = studentId ?? _db.currentUser?.id;
+    if (id == null) return;
+    final p = _db.participants.values
+        .where((p) => p.sessionId == sessionId && p.studentId == id)
+        .firstOrNull;
+    if (p == null) return;
     _db.participants[p.id] = p.copyWith(connected: connected);
     _db.ping('session:$sessionId');
   }
 
   QuizSession _require(String sessionId) {
     final s = _db.sessions[sessionId];
-    if (s == null) throw const AppFailure('Session not found.');
+    if (s == null) {
+      throw const AppFailure('Session not found.', code: 'NOT_FOUND');
+    }
     return s;
   }
 
@@ -964,7 +1491,7 @@ class _Sessions implements SessionRepository {
   }
 
   /// Records a 0-point, unanswered response for anyone who did not answer the
-  /// question that just closed, so analytics + streaks stay consistent.
+  /// question that just closed, so analytics and streaks stay consistent.
   void _autoZeroMissing(QuizSession s) {
     final idx = s.currentQuestionIndex;
     final qs = _sessionQuestions[s.id]!;
@@ -1003,22 +1530,37 @@ class _Sessions implements SessionRepository {
     final s = _require(sessionId);
     if (s.isEnded) return;
     if (s.isActive) _autoZeroMissing(s);
-    _db.sessions[sessionId] = s.copyWith(
+    final ended = s.copyWith(
       status: SessionStatus.ended,
       phase: SessionPhase.revealing,
       endedAt: DateTime.now(),
     );
-    // Fold session scores into the global/all-time leaderboard.
-    for (final p in _participants(sessionId)) {
-      final cum = _db.cumulative.putIfAbsent(
-        p.studentId,
-        () => _Cum(p.studentId, p.displayName),
+    _db.sessions[sessionId] = ended;
+
+    // One durable record per player. This is the only storage write a whole
+    // session produces, and it happens once, at the end.
+    final subject = _db.quizzes[s.quizId]?.subject ?? '';
+    final ranked = _participants(sessionId);
+    for (var i = 0; i < ranked.length; i++) {
+      final p = ranked[i];
+      _db.results.add(
+        _Played(
+          studentId: p.studentId,
+          displayName: p.displayName,
+          sessionId: sessionId,
+          quizId: s.quizId,
+          quizTitle: s.quizTitle,
+          subject: subject,
+          points: p.totalScore,
+          correct: p.correctCount,
+          answered: p.answeredCount,
+          totalQuestions: s.totalQuestions,
+          rank: i + 1,
+          playedAt: ended.endedAt ?? DateTime.now(),
+        ),
       );
-      cum.points += p.totalScore;
-      cum.quizzes += 1;
-      cum.correct += p.correctCount;
-      cum.answered += p.answeredCount;
     }
+    _db.touch(_Col.results);
     _db.ping('session:$sessionId');
     _db.ping('sessions');
     _db.ping('leaderboard');
@@ -1027,41 +1569,56 @@ class _Sessions implements SessionRepository {
   @override
   Future<QuizResponse> submitAnswer({
     required String sessionId,
-    required AppUser student,
+    AppUser? student,
     required int questionIndex,
     required int selectedIndex,
-    required int responseTimeMs,
+    int responseTimeMs = 0,
   }) async {
+    final user = student ?? _db.currentUser;
+    if (user == null) {
+      throw const AppFailure('Not signed in.', code: 'UNAUTHORIZED');
+    }
     final s = _require(sessionId);
     final qs = _sessionQuestions[sessionId]!;
     if (questionIndex != s.currentQuestionIndex ||
         s.phase != SessionPhase.asking ||
         !s.isActive) {
-      throw const AppFailure('That question is not accepting answers.');
+      throw const AppFailure(
+        'That question is not accepting answers.',
+        code: 'CONFLICT',
+      );
     }
-    final participant = _db.participants.values.firstWhere(
-      (p) => p.sessionId == sessionId && p.studentId == student.id,
-      orElse: () => throw const AppFailure('Join the session first.'),
-    );
-    // Idempotent: ignore repeats / double taps / reconnect replays.
-    final prior = _db.responses.values.where(
-      (r) =>
-          r.sessionId == sessionId &&
-          r.studentId == student.id &&
-          r.questionIndex == questionIndex,
-    );
-    if (prior.isNotEmpty) return prior.first;
+    final participant = _db.participants.values
+        .where((p) => p.sessionId == sessionId && p.studentId == user.id)
+        .firstOrNull;
+    if (participant == null) {
+      throw const AppFailure('Join the session first.', code: 'NOT_FOUND');
+    }
+    // Idempotent: repeats, double taps and reconnect replays return the first.
+    final prior = _db.responses.values
+        .where(
+          (r) =>
+              r.sessionId == sessionId &&
+              r.studentId == user.id &&
+              r.questionIndex == questionIndex,
+        )
+        .firstOrNull;
+    if (prior != null) return prior;
 
     final question = qs[questionIndex];
     final limitMs = question.timeLimitSeconds * 1000;
-    final clampedMs = responseTimeMs.clamp(0, limitMs);
+    // Timed here, from the session's own clock — not from the caller. The
+    // `responseTimeMs` argument is ignored, exactly as the server ignores it.
+    final startedAt = s.questionStartedAt ?? DateTime.now();
+    final elapsedMs = DateTime.now().difference(startedAt).inMilliseconds;
+    final clampedMs = elapsedMs.clamp(0, limitMs);
     final isCorrect =
         selectedIndex >= 0 && selectedIndex == question.correctIndex;
 
-    final quiz = _db.quizzes[s.quizId];
-    final scoring = quiz?.scoring ?? const ScoringConfig();
-    final past = responseTimeMs > limitMs;
-    final points = past
+    final scoring = _db.quizzes[s.quizId]?.scoring ?? const ScoringConfig();
+    // 750 ms of grace, matching the server.
+    final tooLate = elapsedMs > limitMs + 750;
+    final points = tooLate
         ? 0
         : scoring.pointsFor(
             isCorrect: isCorrect,
@@ -1072,7 +1629,7 @@ class _Sessions implements SessionRepository {
     final response = QuizResponse(
       id: newId(),
       sessionId: sessionId,
-      studentId: student.id,
+      studentId: user.id,
       questionId: question.id,
       questionIndex: questionIndex,
       selectedIndex: selectedIndex,
@@ -1089,6 +1646,7 @@ class _Sessions implements SessionRepository {
       streak: isCorrect ? participant.streak + 1 : 0,
       lastAnsweredIndex: questionIndex,
     );
+    // Notifies watchers only — a 50-answer burst writes nothing to storage.
     _db.ping('session:$sessionId');
     return response;
   }
@@ -1102,19 +1660,65 @@ class _Leaderboard implements LeaderboardRepository {
   _Leaderboard(this._db);
   final _Db _db;
 
-  List<LeaderboardEntry> _snapshot() {
-    final entries = _db.cumulative.values
-        .map(
-          (c) => LeaderboardEntry(
-            studentId: c.studentId,
-            displayName: c.name,
-            points: c.points,
-            quizzesPlayed: c.quizzes,
-            correctRate: c.answered == 0 ? 0 : c.correct / c.answered,
-          ),
-        )
-        .toList();
-    entries.sort((a, b) => b.points.compareTo(a.points));
+  static const _windows = <String, Duration?>{
+    'week': Duration(days: 7),
+    'month': Duration(days: 30),
+    'all-time': null,
+  };
+
+  /// `period` and `subject` really filter, over the per-session result records.
+  /// The old implementation kept one ever-growing cumulative total per student
+  /// and ignored both parameters, which made the UI's toggle a dead control.
+  List<LeaderboardEntry> _snapshot(String period, String? subject) {
+    if (!_windows.containsKey(period)) {
+      throw AppFailure(
+        'period must be one of: ${_windows.keys.join(', ')}.',
+        code: 'VALIDATION',
+        field: 'period',
+      );
+    }
+    final window = _windows[period];
+    final since = window == null ? null : DateTime.now().subtract(window);
+    final wanted = subject?.trim().toLowerCase();
+
+    final byStudent = <String, _Agg>{};
+    for (final r in _db.results) {
+      if (since != null && r.playedAt.isBefore(since)) continue;
+      if (wanted != null &&
+          wanted.isNotEmpty &&
+          r.subject.toLowerCase() != wanted) {
+        continue;
+      }
+      final agg = byStudent.putIfAbsent(
+        r.studentId,
+        () => _Agg(r.studentId, r.displayName),
+      );
+      agg.points += r.points;
+      agg.quizzes += 1;
+      agg.correct += r.correct;
+      agg.answered += r.answered;
+      agg.name = r.displayName;
+    }
+
+    final entries =
+        byStudent.values
+            .map(
+              (a) => LeaderboardEntry(
+                studentId: a.studentId,
+                displayName: a.name,
+                points: a.points,
+                quizzesPlayed: a.quizzes,
+                correctRate: a.answered == 0 ? 0 : a.correct / a.answered,
+              ),
+            )
+            .toList()
+          ..sort((a, b) {
+            final byPoints = b.points.compareTo(a.points);
+            return byPoints != 0
+                ? byPoints
+                : a.displayName.compareTo(b.displayName);
+          });
+
     return [
       for (var i = 0; i < entries.length; i++) entries[i].copyWith(rank: i + 1),
     ];
@@ -1124,7 +1728,26 @@ class _Leaderboard implements LeaderboardRepository {
   Stream<List<LeaderboardEntry>> watchGlobal({
     String period = 'all-time',
     String? subject,
-  }) => _db.watch(['leaderboard'], _snapshot);
+  }) => _db.watch(['leaderboard'], () => _snapshot(period, subject));
+
+  @override
+  Future<List<String>> subjects() async {
+    final out = <String>{
+      for (final r in _db.results)
+        if (r.subject.trim().isNotEmpty) r.subject,
+    }.toList()..sort();
+    return out;
+  }
+}
+
+class _Agg {
+  _Agg(this.studentId, this.name);
+  final String studentId;
+  String name;
+  int points = 0;
+  int quizzes = 0;
+  int correct = 0;
+  int answered = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1135,17 +1758,19 @@ class _Analytics implements AnalyticsRepository {
   _Analytics(this._db);
   final _Db _db;
 
+  /// Totals come from the durable result records; the per-question breakdown
+  /// needs individual responses, which this backend keeps in RAM only — so it
+  /// covers sessions played in this run. The server-backed implementation has
+  /// the full history.
   @override
   Future<QuizAnalytics> quizAnalytics(String quizId) async {
-    final sessions = _db.sessions.values
+    final played = _db.results.where((r) => r.quizId == quizId).toList();
+    final endedIds = _db.sessions.values
         .where((s) => s.quizId == quizId && s.status == SessionStatus.ended)
-        .toList();
-    final sessionIds = sessions.map((s) => s.id).toSet();
+        .map((s) => s.id)
+        .toSet();
     final responses = _db.responses.values
-        .where((r) => sessionIds.contains(r.sessionId))
-        .toList();
-    final participants = _db.participants.values
-        .where((p) => sessionIds.contains(p.sessionId))
+        .where((r) => endedIds.contains(r.sessionId))
         .toList();
 
     final questions =
@@ -1155,69 +1780,65 @@ class _Analytics implements AnalyticsRepository {
     final stats = <QuestionStat>[];
     for (final q in questions) {
       final rs = responses.where((r) => r.questionId == q.id).toList();
-      final answered = rs.where((r) => r.selectedIndex >= 0).length;
-      final correct = rs.where((r) => r.isCorrect).length;
+      final attempted = rs.where((r) => r.selectedIndex >= 0).toList();
       stats.add(
         QuestionStat(
           questionId: q.id,
           text: q.text,
-          answers: answered,
-          correct: correct,
+          answers: attempted.length,
+          correct: rs.where((r) => r.isCorrect).length,
           orderIndex: q.orderIndex,
+          averageTimeMs: attempted.isEmpty
+              ? 0
+              : attempted.map((r) => r.responseTimeMs).reduce((a, b) => a + b) ~/
+                    attempted.length,
         ),
       );
     }
 
-    final avgScore = participants.isEmpty
+    final sessionsRun = played.map((r) => r.sessionId).toSet().length;
+    final avgScore = played.isEmpty
         ? 0.0
-        : participants.map((p) => p.totalScore).reduce((a, b) => a + b) /
-              participants.length;
-    final totalAns = responses.where((r) => r.selectedIndex >= 0).length;
-    final totalCorrect = responses.where((r) => r.isCorrect).length;
-    final completion = participants.isEmpty || questions.isEmpty
+        : played.map((r) => r.points).reduce((a, b) => a + b) / played.length;
+    final totalAnswered = played.fold<int>(0, (a, r) => a + r.answered);
+    final totalCorrect = played.fold<int>(0, (a, r) => a + r.correct);
+    final completion = played.isEmpty
         ? 0.0
-        : participants
-                  .map((p) => p.answeredCount / questions.length)
+        : played
+                  .map(
+                    (r) => r.totalQuestions == 0
+                        ? 0.0
+                        : (r.answered / r.totalQuestions).clamp(0.0, 1.0),
+                  )
                   .reduce((a, b) => a + b) /
-              participants.length;
+              played.length;
 
     return QuizAnalytics(
       quizId: quizId,
-      sessionsRun: sessions.length,
-      participants: participants.length,
+      sessionsRun: sessionsRun,
+      participants: played.length,
       averageScore: avgScore,
-      averageCorrectRate: totalAns == 0 ? 0 : totalCorrect / totalAns,
-      completionRate: completion.clamp(0, 1),
+      averageCorrectRate: totalAnswered == 0 ? 0 : totalCorrect / totalAnswered,
+      completionRate: completion,
       questionStats: stats,
     );
   }
 
   @override
   Future<List<StudentQuizResult>> studentHistory(String studentId) async {
-    final out = <StudentQuizResult>[];
-    final ended = _db.sessions.values
-        .where((s) => s.status == SessionStatus.ended)
-        .toList();
-    for (final s in ended) {
-      final ranked =
-          _db.participants.values.where((p) => p.sessionId == s.id).toList()
-            ..sort((a, b) => b.totalScore.compareTo(a.totalScore));
-      final idx = ranked.indexWhere((p) => p.studentId == studentId);
-      if (idx == -1) continue;
-      final me = ranked[idx];
-      out.add(
-        StudentQuizResult(
-          sessionId: s.id,
-          quizTitle: s.quizTitle,
-          score: me.totalScore,
-          rank: idx + 1,
-          playedAt: s.endedAt ?? s.createdAt,
-          correct: me.correctCount,
-          total: s.totalQuestions,
-        ),
-      );
-    }
-    out.sort((a, b) => b.playedAt.compareTo(a.playedAt));
+    final out = [
+      for (final r in _db.results)
+        if (r.studentId == studentId)
+          StudentQuizResult(
+            sessionId: r.sessionId,
+            quizTitle: r.quizTitle,
+            score: r.points,
+            rank: r.rank,
+            playedAt: r.playedAt,
+            correct: r.correct,
+            total: r.totalQuestions,
+          ),
+    ]..sort((a, b) => b.playedAt.compareTo(a.playedAt));
     return out;
   }
 }

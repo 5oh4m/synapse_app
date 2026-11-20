@@ -1,6 +1,7 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'package:quizzle/core/failure.dart';
 import 'package:quizzle/data/in_memory/in_memory_backend.dart';
 import 'package:quizzle/models/enums.dart';
 import 'package:quizzle/models/question.dart';
@@ -102,9 +103,24 @@ void main() {
     final second = InMemoryBackend();
     await second.init();
     expect(second.auth.currentUser, isNull);
-    // The account itself is still registered — signing back in works.
-    final signedIn =
-        await second.auth.signIn(email: 'jo@test.dev', password: 'password');
-    expect(signedIn.name, 'Jo');
+    // The profile survives the restart, but its password never touches disk
+    // (the first audit found plaintext credentials in local storage). Signing
+    // back in is therefore refused with an explanation, not "wrong password".
+    await expectLater(
+      second.auth.signIn(email: 'jo@test.dev', password: 'password'),
+      throwsA(
+        isA<AppFailure>().having((e) => e.code, 'code', 'NO_CREDENTIAL'),
+      ),
+    );
+    // And the address is still taken: the account itself persisted.
+    await expectLater(
+      second.auth.register(
+        name: 'Jo again',
+        email: 'jo@test.dev',
+        password: 'password',
+        role: UserRole.student,
+      ),
+      throwsA(isA<AppFailure>()),
+    );
   });
 }

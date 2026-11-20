@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { requireAuth, requireRole } from '../middleware/auth.js';
-import { quizJson, questionJson } from '../util/serialize.js';
+import { quizJson, questionJson, redactQuestion } from '../util/serialize.js';
 import { str, int, assertUuid, rejectIdentityFields } from '../util/validate.js';
 import * as svc from '../services/quiz.service.js';
 
@@ -65,14 +65,44 @@ quizRoutes.post('/:id/unpublish', requireAuth, async (req, res) => {
 });
 
 /**
- * Owner-or-published. This carries the answer key, which is correct: practice
- * mode is self-marked and a published quiz is public by the educator's choice.
- * The live-session key lives behind the host-only session endpoint instead.
+ * Owner-or-published, but only the owner gets the answer key.
+ *
+ * This route used to serve correct_index to anyone once a quiz was published
+ * "for practice". Go Live is only offered on published quizzes and every
+ * student receives quiz_id in the session payload, so every live game's key
+ * was one request away. Everyone else now gets redacted questions, and none at
+ * all while the quiz is being played live; practice answers are graded by
+ * POST /quizzes/:id/practice/answer instead.
  */
 quizRoutes.get('/:id/questions', requireAuth, async (req, res) => {
   assertUuid(req.params.id, 'id');
-  await svc.readableQuiz(req.params.id, req.user.sub);
-  res.json((await svc.listQuestions(req.params.id)).map(questionJson));
+  const quiz = await svc.readableQuiz(req.params.id, req.user.sub);
+  const rows = (await svc.listQuestions(quiz.id)).map(questionJson);
+  if (quiz.owner_id === req.user.sub) return res.json(rows);
+  await svc.assertNotLive(quiz.id);
+  res.json(rows.map(redactQuestion));
+});
+
+/**
+ * Grades one practice answer. Stateless: practice never touches scores or the
+ * leaderboard. Returns the key for that one question after the player has
+ * committed to an answer, which is the same thing a self-marked runner showed.
+ */
+quizRoutes.post('/:id/practice/answer', requireAuth, async (req, res) => {
+  assertUuid(req.params.id, 'id');
+  rejectIdentityFields(req.body);
+  const quiz = await svc.readableQuiz(req.params.id, req.user.sub);
+  if (quiz.owner_id !== req.user.sub) await svc.assertNotLive(quiz.id);
+  assertUuid(req.body?.question_id, 'question_id');
+  const selected = int(req.body, 'selected_index', { required: true, min: -1, max: 3 });
+  const question = await svc.quizQuestion(quiz.id, req.body.question_id);
+  res.json({
+    question_id: question.id,
+    selected_index: selected,
+    is_correct: selected >= 0 && selected === question.correct_index,
+    correct_index: question.correct_index,
+    explanation: question.explanation ?? '',
+  });
 });
 
 quizRoutes.post('/:id/questions', requireAuth, async (req, res) => {

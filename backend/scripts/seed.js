@@ -4,6 +4,8 @@
 // plus one library item and one published 5-question quiz.
 //
 // Idempotent: run it twice and it updates rather than duplicating.
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { assertConfig, config } from '../src/config.js';
 import { pool, one, withTransaction, closePool } from '../src/db/pool.js';
 import { hashPassword } from '../src/services/auth.service.js';
@@ -194,7 +196,7 @@ export async function seed({ silent = false } = {}) {
   return { educator, student, others, quizId: quiz.id };
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
   assertConfig();
   console.log(`seeding ${config.databaseUrl}`);
   seed()

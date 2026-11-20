@@ -1,34 +1,35 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+import '../data/repositories.dart';
 import '../models/enums.dart';
+import '../models/extracted_content.dart';
 
-class ExtractedContent {
-  const ExtractedContent({
-    required this.text,
-    required this.pageCount,
-    required this.sourceType,
-  });
-  final String text;
-  final int pageCount;
-  final ContentType sourceType;
-}
+export '../models/extracted_content.dart';
 
-/// Pulls text out of an uploaded file before it goes to the LLM. This keeps
-/// token cost down and accuracy up (spec section 6 / 7).
+/// Gets text out of a source file so the generator has something to work from.
 ///
-/// The spec's full pipeline runs server-side (PyMuPDF / python-pptx / OCR).
-/// This client-side extractor covers the cases that work without native libs:
-///  - plain text / markdown files and pasted text
-///  - PDFs: best-effort extraction of parenthesised text tokens from the
-///    uncompressed portions of the byte stream
-///  - PPTX: unzip not available here, so we fall back to any embedded XML text
-///  - images: no on-device OCR; the educator is asked to paste a caption
+/// **What this class used to do, and no longer does.** It claimed a `POST
+/// /extract` endpoint and a `ContentExtractor.viaBackend` method that never
+/// existed; it counted PDF pages by counting `endobj` markers (a one-page file
+/// reported 40+ pages, because `endobj` marks every object, not every page);
+/// and it ran a `<a:t>` regex over the raw bytes of a `.pptx`, which is a ZIP
+/// archive — the tags it was looking for are deflate-compressed and can never
+/// match. All of that is deleted.
 ///
-/// When the Node backend is enabled it exposes POST /extract which does the
-/// real thing; [ContentExtractor.viaBackend] is used then.
+/// Real parsing happens on the server (`POST /content/extract` and `POST
+/// /content/upload`), which has `pdf-parse` for PDF text plus a true page count
+/// from the page tree, and unzip + XML parsing for PPTX slides and notes.
+/// No OCR is bundled anywhere, so an image comes back `needs_text` and the UI
+/// asks the educator to paste the text. See docs/API.md.
 class ContentExtractor {
-  const ContentExtractor();
+  const ContentExtractor([this._content]);
+
+  final ContentRepository? _content;
+
+  /// Whether a server-side extractor is wired up. `false` for the offline
+  /// backend, which can only read plain text.
+  bool get hasServerExtraction => _content != null;
 
   ContentType typeForExtension(String? name) {
     final ext = (name ?? '').toLowerCase().split('.').last;
@@ -43,6 +44,8 @@ class ContentExtractor {
       case 'jpeg':
       case 'gif':
       case 'webp':
+      case 'bmp':
+      case 'heic':
         return ContentType.image;
       default:
         return ContentType.text;
@@ -51,93 +54,102 @@ class ContentExtractor {
 
   ExtractedContent fromText(String text) => ExtractedContent(
     text: text.trim(),
-    pageCount: 1,
+    pageCount: text.trim().isEmpty ? 0 : 1,
     sourceType: ContentType.text,
+    status: text.trim().isEmpty
+        ? ExtractionStatus.needsText
+        : ExtractionStatus.ready,
   );
 
+  /// Sends the file to the backend and returns what the server actually read.
+  ///
+  /// Plain text and Markdown are decoded locally because that is a decode, not
+  /// a parse — there is nothing to get wrong and no reason for a round trip.
+  /// Everything else goes to the server; with no server available it reports
+  /// [ExtractionStatus.needsText] instead of guessing.
+  Future<ExtractedContent> extract({
+    required Uint8List bytes,
+    required String fileName,
+  }) async {
+    final type = typeForExtension(fileName);
+    if (type == ContentType.text) {
+      final decoded = _decodeText(bytes);
+      return ExtractedContent(
+        text: decoded,
+        pageCount: decoded.isEmpty ? 0 : 1,
+        sourceType: ContentType.text,
+        status: decoded.isEmpty
+            ? ExtractionStatus.needsText
+            : ExtractionStatus.ready,
+        message: decoded.isEmpty ? 'That file had no readable text.' : null,
+        fileName: fileName,
+      );
+    }
+
+    final repo = _content;
+    if (repo == null) {
+      return ExtractedContent.needsText(
+        sourceType: type,
+        fileName: fileName,
+        message: _offlineMessage(type),
+      );
+    }
+    return repo.extractFile(fileName: fileName, bytes: bytes);
+  }
+
+  /// Synchronous, local-only inspection of a picked file.
+  ///
+  /// It decodes plain text and otherwise tells the truth: no page count is
+  /// invented and no content is parsed on device. Use [extract] to get the real
+  /// text for PDF/PPTX.
   ExtractedContent fromBytes({
     required Uint8List bytes,
     required String fileName,
   }) {
     final type = typeForExtension(fileName);
-    switch (type) {
-      case ContentType.text:
-        return ExtractedContent(
-          text: _safeUtf8(bytes),
-          pageCount: 1,
-          sourceType: type,
-        );
-      case ContentType.pdf:
-        final text = _naivePdfText(bytes);
-        final pages = '\nendobj'.allMatches(_safeLatin1(bytes)).length;
-        return ExtractedContent(
-          text: text,
-          pageCount: pages > 0 ? pages : 1,
-          sourceType: type,
-        );
-      case ContentType.pptx:
-        return ExtractedContent(
-          text: _xmlishText(_safeLatin1(bytes)),
-          pageCount: 1,
-          sourceType: type,
-        );
-      case ContentType.image:
-        return const ExtractedContent(
-          text: '',
-          pageCount: 1,
-          sourceType: ContentType.image,
-        );
+    if (type == ContentType.text) {
+      final decoded = _decodeText(bytes);
+      return ExtractedContent(
+        text: decoded,
+        pageCount: decoded.isEmpty ? 0 : 1,
+        sourceType: type,
+        status: decoded.isEmpty
+            ? ExtractionStatus.needsText
+            : ExtractionStatus.ready,
+        fileName: fileName,
+      );
     }
+    return ExtractedContent.needsText(
+      sourceType: type,
+      fileName: fileName,
+      message: hasServerExtraction
+          ? '${_label(type)} files are extracted on the server. Upload it to read the text.'
+          : _offlineMessage(type),
+    );
   }
 
-  String _safeUtf8(Uint8List b) {
+  String _offlineMessage(ContentType type) => switch (type) {
+    ContentType.image =>
+      'No OCR is bundled, on device or on the server. Paste the text from the '
+          'image below.',
+    _ =>
+      '${_label(type)} extraction runs on the backend. Start it with '
+          '`cd backend && npm start` and run the app with '
+          '--dart-define=BACKEND=remote, or paste the text below.',
+  };
+
+  String _label(ContentType type) => switch (type) {
+    ContentType.pdf => 'PDF',
+    ContentType.pptx => 'PowerPoint',
+    ContentType.image => 'Image',
+    ContentType.text => 'Text',
+  };
+
+  String _decodeText(Uint8List bytes) {
     try {
-      return utf8.decode(b, allowMalformed: true).trim();
+      return utf8.decode(bytes, allowMalformed: true).trim();
     } catch (_) {
       return '';
     }
   }
-
-  String _safeLatin1(Uint8List b) => latin1.decode(b, allowInvalid: true);
-
-  /// Extracts text drawn with Tj / TJ operators from the uncompressed parts of
-  /// a PDF. Misses content in compressed (FlateDecode) streams; good enough for
-  /// simple exported slide decks and text PDFs. Real extraction is server-side.
-  String _naivePdfText(Uint8List bytes) {
-    final raw = _safeLatin1(bytes);
-    final buf = StringBuffer();
-    final re = RegExp(r'\(((?:[^()\\]|\\.)*)\)\s*T[jJ]');
-    for (final m in re.allMatches(raw)) {
-      final s = m
-          .group(1)!
-          .replaceAll(r'\(', '(')
-          .replaceAll(r'\)', ')')
-          .replaceAll(r'\\', r'\');
-      if (s.trim().isNotEmpty) buf.write('$s ');
-    }
-    final arrRe = RegExp(r'\[((?:[^\]])*)\]\s*TJ');
-    for (final m in arrRe.allMatches(raw)) {
-      final inner = m.group(1)!;
-      for (final sm in RegExp(r'\(((?:[^()\\]|\\.)*)\)').allMatches(inner)) {
-        buf.write(sm.group(1));
-      }
-      buf.write(' ');
-    }
-    return _collapse(buf.toString());
-  }
-
-  String _xmlishText(String raw) {
-    final buf = StringBuffer();
-    for (final m in RegExp(r'<a:t>([^<]*)</a:t>').allMatches(raw)) {
-      buf.write('${m.group(1)} ');
-    }
-    if (buf.isEmpty) {
-      for (final m in RegExp(r'>([A-Za-z0-9 ,.\-]{4,})<').allMatches(raw)) {
-        buf.write('${m.group(1)} ');
-      }
-    }
-    return _collapse(buf.toString());
-  }
-
-  String _collapse(String s) => s.replaceAll(RegExp(r'\s+'), ' ').trim();
 }

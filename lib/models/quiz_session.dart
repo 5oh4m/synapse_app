@@ -16,6 +16,7 @@ class QuizSession {
     this.phase = SessionPhase.asking,
     this.questionStartedAt,
     this.questionEndsAt,
+    this.revealedAt,
     this.startedAt,
     this.endedAt,
     this.allowLateJoin = true,
@@ -34,6 +35,7 @@ class QuizSession {
   final SessionPhase phase;
   final DateTime? questionStartedAt;
   final DateTime? questionEndsAt;
+  final DateTime? revealedAt;
   final DateTime? startedAt;
   final DateTime? endedAt;
   final bool allowLateJoin;
@@ -52,6 +54,7 @@ class QuizSession {
     SessionPhase? phase,
     DateTime? questionStartedAt,
     DateTime? questionEndsAt,
+    DateTime? revealedAt,
     DateTime? startedAt,
     DateTime? endedAt,
     bool? allowLateJoin,
@@ -67,6 +70,7 @@ class QuizSession {
     phase: phase ?? this.phase,
     questionStartedAt: questionStartedAt ?? this.questionStartedAt,
     questionEndsAt: questionEndsAt ?? this.questionEndsAt,
+    revealedAt: revealedAt ?? this.revealedAt,
     startedAt: startedAt ?? this.startedAt,
     endedAt: endedAt ?? this.endedAt,
     allowLateJoin: allowLateJoin ?? this.allowLateJoin,
@@ -85,6 +89,7 @@ class QuizSession {
     'phase': phase.name,
     'question_started_at': questionStartedAt?.toIso8601String(),
     'question_ends_at': questionEndsAt?.toIso8601String(),
+    'revealed_at': revealedAt?.toIso8601String(),
     'started_at': startedAt?.toIso8601String(),
     'ended_at': endedAt?.toIso8601String(),
     'allow_late_join': allowLateJoin,
@@ -113,6 +118,7 @@ class QuizSession {
       j['question_started_at'] as String? ?? '',
     ),
     questionEndsAt: DateTime.tryParse(j['question_ends_at'] as String? ?? ''),
+    revealedAt: DateTime.tryParse(j['revealed_at'] as String? ?? ''),
     startedAt: DateTime.tryParse(j['started_at'] as String? ?? ''),
     endedAt: DateTime.tryParse(j['ended_at'] as String? ?? ''),
     allowLateJoin: (j['allow_late_join'] ?? true) as bool,

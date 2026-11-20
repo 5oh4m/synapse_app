@@ -146,7 +146,10 @@ void main() {
     },
   );
 
-  test('late join is rejected once the session locks', () async {
+  // Named for what it checks. It used to be called "late join is rejected once
+  // the session locks" while asserting the join succeeded. No API creates a
+  // session with allowLateJoin: false, so there is no rejection to test.
+  test('a student can join mid-quiz and starts on zero', () async {
     final host = await backend.auth.register(
       name: 'H',
       email: 'h2@t.dev',
@@ -176,5 +179,6 @@ void main() {
       student: s,
     );
     expect(p.totalScore, 0);
+    expect(p.lastAnsweredIndex, -1);
   });
 }

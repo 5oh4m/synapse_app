@@ -18,10 +18,16 @@ suggestions.
    Session control: caller must be `host_id`. Wrong owner → `404` (not `403`; do not leak
    existence).
 4. **The answer key never leaves the server before reveal.** There is exactly one student-facing
-   question endpoint and it redacts. The full-key endpoint is host-only.
+   live question endpoint and it redacts. The full-key endpoints are host-only (session) and
+   owner-only (quiz). "The key" includes anything derived from it: correctness and points in an
+   answer response, the per-question breakdown in results, and practice grading of a quiz that
+   is being played live. A participant also never reads a question the class has not reached.
 5. **CORS is an explicit allowlist** from `CORS_ORIGINS` env. No `*`.
-6. **Rate limits:** `/auth/login` and `/auth/register` 10/15min per IP; `/generate` 20/hour per
-   user. Return `429` with `Retry-After`.
+6. **Rate limits, keyed for a classroom behind one IP:** sign-in and register 10 failed attempts
+   per 15 min per (IP, email) plus a 300 per 15 min ceiling per IP; `/generate` 20/hour per
+   user; everything else 600/min per signed-in user (per IP when anonymous). Return `429` with
+   `Retry-After`. `X-Forwarded-For` is ignored unless `TRUST_PROXY_HOPS` says a proxy is in
+   front.
 7. **Body limit** 1 MB, enforced while reading, connection destroyed past it.
 
 ## Auth
@@ -74,7 +80,8 @@ to paste the text, and say so honestly in the UI. Never claim extraction that di
 | DELETE | `/quizzes/:id` | Bearer owner | `204`, cascades questions |
 | POST | `/quizzes/:id/publish` | Bearer owner | `409` if <2 questions or any invalid |
 | POST | `/quizzes/:id/unpublish` | Bearer owner | |
-| GET | `/quizzes/:id/questions` | Bearer owner-or-published | |
+| GET | `/quizzes/:id/questions` | Bearer owner-or-published | **key for the owner only**; others get redacted questions, and `409` while a session of the quiz is open |
+| POST | `/quizzes/:id/practice/answer` | Bearer owner-or-published | `{question_id, selected_index}` → `{is_correct, correct_index, explanation}`; `409` while live |
 | POST | `/quizzes/:id/questions` | Bearer owner | `{questions:[...]}` appends |
 | PUT | `/questions/:id` | Bearer owner | **replaces in place, keeps the id and order_index** |
 | DELETE | `/questions/:id` | Bearer owner | `204`, resequences siblings |
@@ -121,13 +128,13 @@ times, then return `502` with the reason. Never crash the process.
 | POST | `/sessions/join` | Bearer student | `{join_code}`; student = token user; idempotent |
 | GET | `/sessions/:id/participants` | Bearer host-or-participant | |
 | GET | `/sessions/:id/questions` | **Bearer HOST ONLY** | full answer key |
-| GET | `/sessions/:id/current-question` | Bearer participant-or-host | **redacted until revealed** |
-| POST | `/sessions/:id/answer` | Bearer participant | `{selected_index}` — **no timing field** |
+| GET | `/sessions/:id/current-question` | Bearer participant-or-host | `?index=`; **redacted until revealed**; participants get `404` for any index past the current one (and in the lobby); `my_response` once revealed |
+| POST | `/sessions/:id/answer` | Bearer participant | `{selected_index, question_index?}` — **no timing field**; no `is_correct`/`points_awarded` until revealed |
 | POST | `/sessions/:id/start` | **Bearer HOST ONLY** | |
 | POST | `/sessions/:id/reveal` | **Bearer HOST ONLY** | |
 | POST | `/sessions/:id/next` | **Bearer HOST ONLY** | ends session past last question |
 | POST | `/sessions/:id/end` | **Bearer HOST ONLY** | |
-| GET | `/sessions/:id/results` | Bearer host-or-participant | final board + own breakdown |
+| GET | `/sessions/:id/results` | Bearer host-or-participant | board + own breakdown of **revealed questions only** |
 
 Redacted question = `correct_index: -1`, `explanation: ""`.
 
@@ -137,7 +144,12 @@ enforced by a unique constraint — a second submit returns the first result, `2
 Scoring `base + round(speed_bonus_max * (1 - elapsed/limit))` when correct, else 0, clamped at 0.
 
 A session auto-reveals server-side when `question_ends_at` passes, driven by one timer, so a
-host closing their laptop does not freeze the class.
+host closing their laptop does not freeze the class. Clients must not reveal on their own
+countdown: a host device with a fast clock would cut every question short.
+
+Join is idempotent and quiet: a re-join returns the existing participant and broadcasts nothing.
+Presence (`connected`) is derived by the server from open sockets (see Realtime), not from
+`POST /sessions/:id/connected`, which remains only for older clients.
 
 ## Realtime
 
@@ -147,16 +159,25 @@ The previous version broadcast `{channel}` to every socket and every client then
 everything, plus polled every 5s. That is a thundering herd. Instead:
 
 - Client sends `{action:"subscribe", session_id}`; the socket joins **that session's room only**.
+- Every frame is `{type, session_id, data, at}`. `session_id` routes it; `at` is the server's send
+  time, which clients use to estimate their clock offset for countdowns.
 - The server pushes **state deltas**, never "go refetch":
-  - `{type:"session.state", data:{status,current_question_index,phase,question_ends_at,…}}`
-  - `{type:"participant.joined", data:{id,display_name}}`
-  - `{type:"answer.count", data:{answered,total}}` — counts only, no identities, during `asking`
-  - `{type:"question.revealed", data:{correct_index,explanation,distribution:[n,n,n,n]}}`
-  - `{type:"scoreboard", data:[{participant_id,display_name,total_score,rank}]}`
-  - `{type:"session.ended", data:{…}}`
+  - `session.state` — `{status,current_question_index,phase,question_ends_at,…}`
+  - `participant.joined` — `{id,display_name}`, only when a participant row is created
+  - `participant.presence` — `{id, connected}`, from sockets opening and closing (5 s grace)
+  - `answer.count` — `{answered,total}`, counts only, no identities, during `asking`
+  - `question.revealed` — `{question_index,correct_index,explanation,distribution:[n,n,n,n]}`
+  - `answer.result` — `{question_index,selected_index,is_correct,points_awarded,…}`, **sent only to
+    the answering player's own sockets**, at reveal
+  - `scoreboard` — `[{participant_id,display_name,total_score,rank}]`
+  - `session.ended` — `{…}`
 - Answer-count updates coalesce on a 250 ms tick, so 50 simultaneous answers produce ~1 message.
-- Heartbeat ping every 30s; drop dead sockets.
-- **The client must not poll.** Refetch only on socket reconnect, to resync once.
+- Heartbeat ping every 30s; drop dead sockets. Clients may send `{action:"ping"}` and get a
+  `pong` frame; they should, to detect half-open links.
+- A socket is closed with code **4001** when the access token it opened with expires. Clients
+  refresh the token and reconnect immediately. Client frames are capped at 64 KB.
+- **The client must not poll.** Refetch only on socket reconnect, to resync once; a reveal
+  needs no request at all.
 
 ## Errors
 
@@ -214,6 +235,12 @@ CORS_ORIGINS=http://localhost:8090,http://localhost:5000
 AI_PROVIDER=mock
 ANTHROPIC_API_KEY=
 ANTHROPIC_MODEL=claude-sonnet-4-20250514
+TRUST_PROXY_HOPS=0          # set to the number of reverse proxies in front, never higher
+RATE_LIMIT_AUTH=10          # failed sign-ins per (IP, email) per 15 min
+RATE_LIMIT_AUTH_IP=300      # all sign-ins/registrations per IP per 15 min
+RATE_LIMIT_GLOBAL=600       # requests per signed-in user per minute
+PRESENCE_GRACE_MS=5000
+WS_MAX_PAYLOAD_BYTES=65536
 ```
 Fail fast at boot with a clear message if `JWT_SECRET` or `DATABASE_URL` is missing. Handle
 `EADDRINUSE` with a readable message naming the port, not a stack trace.
@@ -224,7 +251,11 @@ Fail fast at boot with a clear message if `JWT_SECRET` or `DATABASE_URL` is miss
   same providers; only the implementation changes.
 - Tokens in `flutter_secure_storage` where available, `shared_preferences` as web fallback.
   **Never** persist passwords client-side — the old in-memory backend did and must stop.
-- A single Dio interceptor refreshes on `401` once, queues concurrent failures, and signs out if
-  refresh fails.
+- A single Dio interceptor refreshes on `401` once, queues concurrent failures, and signs out
+  only if the server **rejects** the refresh — a refresh that cannot reach the server leaves the
+  session alone.
+- The WebSocket authenticates outside that interceptor, so the realtime client refreshes before
+  opening a socket when the access token expires within 60 s, and once more after a refused
+  upgrade or a `4001` close.
 - The offline/in-memory backend stays for tests and zero-setup demo but **must not** be sold as
   multi-device, and must stop writing credentials to local storage.

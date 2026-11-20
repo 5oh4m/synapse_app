@@ -45,7 +45,9 @@ function corsMiddleware() {
 export function createApp() {
   const app = express();
 
-  app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS || 1));
+  // 0 unless deployed behind a proxy: with nothing in front, trusting one hop
+  // let any client pick its own IP via X-Forwarded-For and walk past the limits.
+  app.set('trust proxy', config.trustProxyHops);
   app.disable('x-powered-by');
   app.set('etag', false);
 
@@ -111,6 +113,7 @@ export function createApp() {
   api.use('/leaderboard', leaderboardRoutes);
   api.use('/analytics', analyticsRoutes);
   app.use('/api', api);
+  app.use(api);
 
   // Unrouted paths get the same error envelope as everything else.
   app.use((req, _res, next) => next(notFound(`No route for ${req.method} ${req.path}.`)));

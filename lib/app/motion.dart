@@ -455,6 +455,98 @@ class GrowBar extends StatelessWidget {
   }
 }
 
+/// Swaps its child when [switchKey] changes, mechanically: the outgoing plane
+/// leaves at once and the incoming one slides in [distance] along [axis]
+/// behind a hard wipe. No cross-fade, no overlap of two planes.
+///
+/// The live screens use it for question-to-question and for panel changes
+/// (submit → locked in → outcome), which used to be hard cuts. The first child
+/// appears without animation; under reduced motion nothing animates.
+class PlaneSwitcher extends StatelessWidget {
+  const PlaneSwitcher({
+    super.key,
+    required this.switchKey,
+    required this.child,
+    this.axis = Axis.horizontal,
+    this.distance = 32,
+    this.duration = durBase,
+    this.animateSize = false,
+  });
+
+  /// A change in this value plays the swap.
+  final Object switchKey;
+
+  final Widget child;
+  final Axis axis;
+  final double distance;
+  final Duration duration;
+
+  /// Also ease the height change between panels of different sizes.
+  final bool animateSize;
+
+  @override
+  Widget build(BuildContext context) {
+    final d = Motion.dur(context, duration);
+    Widget switcher = AnimatedSwitcher(
+      duration: d,
+      layoutBuilder: (current, previous) => current ?? const SizedBox.shrink(),
+      transitionBuilder: (child, animation) => _PlaneIn(
+        animation: animation,
+        axis: axis,
+        distance: distance,
+        child: child,
+      ),
+      child: KeyedSubtree(key: ValueKey(switchKey), child: child),
+    );
+    if (animateSize) {
+      switcher = AnimatedSize(
+        duration: d,
+        curve: easeSnap,
+        alignment: Alignment.topCenter,
+        child: switcher,
+      );
+    }
+    return switcher;
+  }
+}
+
+class _PlaneIn extends AnimatedWidget {
+  const _PlaneIn({
+    required Animation<double> animation,
+    required this.axis,
+    required this.distance,
+    required this.child,
+  }) : super(listenable: animation);
+
+  final Axis axis;
+  final double distance;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    final v = (listenable as Animation<double>).value.clamp(0.0, 1.0);
+    final t = easeSnap.transform(v);
+    final travel = distance * (1 - t);
+    // Same shape at rest as mid-flight, so the child's state survives the
+    // moment the transition completes.
+    return ClipRect(
+      // No clip at rest: focus rings and block-print offsets draw outside the
+      // box and must not be cut off.
+      clipBehavior: v >= 1 ? Clip.none : Clip.hardEdge,
+      clipper: WipeClipper(
+        progress: v >= 1 ? 1 : t,
+        direction: axis == Axis.horizontal
+            ? AxisDirection.right
+            : AxisDirection.down,
+      ),
+      child: Transform.translate(
+        offset: axis == Axis.horizontal ? Offset(travel, 0) : Offset(0, travel),
+        child: child,
+      ),
+    );
+  }
+}
+
 /// Pulses [child] once per second — scale 1.0 -> 1.04 -> 1.0. Used by the
 /// countdown under five seconds. Holds still (and runs no ticker) when
 /// [active] is false or motion is reduced.

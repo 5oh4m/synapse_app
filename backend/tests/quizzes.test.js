@@ -5,6 +5,7 @@ import {
   shutdown,
   makeUser,
   makePublishedQuiz,
+  makeLiveSession,
   sampleQuestions,
   query,
   errorCode,
@@ -13,6 +14,80 @@ import {
 before(resetDb);
 beforeEach(resetDb);
 after(shutdown);
+
+describe('a published quiz never serves its key to students (second audit SEC-6)', () => {
+  test('the owner reads the key; anyone else reads redacted questions', async () => {
+    const owner = await makeUser({ role: 'educator' });
+    const student = await makeUser({ role: 'student' });
+    const { quiz } = await makePublishedQuiz(owner, { count: 2 });
+
+    const mine = await owner.get(`/api/quizzes/${quiz.id}/questions`);
+    assert.equal(mine.body[0].correct_index, 0);
+    assert.ok(mine.body[0].explanation.length > 0);
+
+    const theirs = await student.get(`/api/quizzes/${quiz.id}/questions`);
+    assert.equal(theirs.status, 200);
+    assert.ok(theirs.body.every((q) => q.correct_index === -1 && q.explanation === ''));
+    assert.equal(theirs.body[0].question_text, mine.body[0].question_text);
+  });
+
+  test('while a session of the quiz is open, students get neither questions nor grading', async () => {
+    const owner = await makeUser({ role: 'educator' });
+    const student = await makeUser({ role: 'student' });
+    const { quiz, questions } = await makePublishedQuiz(owner, { count: 2 });
+    const { session } = await makeLiveSession(owner, quiz.id, [student]);
+    await owner.post(`/api/sessions/${session.id}/start`).send({});
+
+    const list = await student.get(`/api/quizzes/${quiz.id}/questions`);
+    assert.equal(list.status, 409, 'the live quiz questions were served');
+    assert.ok(!JSON.stringify(list.body).includes('correct_index'));
+
+    const grade = await student
+      .post(`/api/quizzes/${quiz.id}/practice/answer`)
+      .send({ question_id: questions[0].id, selected_index: 1 });
+    assert.equal(grade.status, 409, 'practice grading revealed the live key');
+
+    await owner.post(`/api/sessions/${session.id}/end`).send({});
+    const later = await student.get(`/api/quizzes/${quiz.id}/questions`);
+    assert.equal(later.status, 200);
+  });
+
+  test('practice answers are graded on the server', async () => {
+    const owner = await makeUser({ role: 'educator' });
+    const student = await makeUser({ role: 'student' });
+    const { quiz, questions } = await makePublishedQuiz(owner, { count: 2 });
+
+    const wrong = await student
+      .post(`/api/quizzes/${quiz.id}/practice/answer`)
+      .send({ question_id: questions[0].id, selected_index: 2 });
+    assert.equal(wrong.status, 200);
+    assert.equal(wrong.body.is_correct, false);
+    assert.equal(wrong.body.correct_index, 0);
+
+    const right = await student
+      .post(`/api/quizzes/${quiz.id}/practice/answer`)
+      .send({ question_id: questions[1].id, selected_index: 0 });
+    assert.equal(right.body.is_correct, true);
+
+    const foreign = await student
+      .post(`/api/quizzes/${quiz.id}/practice/answer`)
+      .send({ question_id: '00000000-0000-4000-8000-000000000000', selected_index: 0 });
+    assert.equal(foreign.status, 404);
+  });
+
+  test('practice on a draft quiz is 404 for anyone but the owner', async () => {
+    const owner = await makeUser({ role: 'educator' });
+    const student = await makeUser({ role: 'student' });
+    const draft = (await owner.post('/api/quizzes').send({ title: 'Draft' })).body;
+    const added = await owner
+      .post(`/api/quizzes/${draft.id}/questions`)
+      .send({ questions: sampleQuestions(2) });
+    const res = await student
+      .post(`/api/quizzes/${draft.id}/practice/answer`)
+      .send({ question_id: added.body[0].id, selected_index: 0 });
+    assert.equal(res.status, 404);
+  });
+});
 
 describe('quiz authorization (the IDOR the audit found)', () => {
   test('a non-owner educator cannot DELETE someone else\'s quiz — 404, and it survives', async () => {

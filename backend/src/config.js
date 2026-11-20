@@ -46,11 +46,21 @@ export const config = {
   bodyLimitBytes: int('BODY_LIMIT_BYTES', 1024 * 1024),
   uploadLimitBytes: int('UPLOAD_LIMIT_BYTES', 20 * 1024 * 1024),
   rateLimits: {
-    // docs/API.md: 10 per 15 min per IP, 20 per hour per user.
+    // docs/API.md: sign-in 10 per 15 min per (IP, email), with a much higher
+    // per-IP ceiling because a whole class shares one school address;
+    // generation 20 per hour per user; everything else per user when signed in.
     auth: int('RATE_LIMIT_AUTH', 10),
+    authPerIp: int('RATE_LIMIT_AUTH_IP', 300),
     generate: int('RATE_LIMIT_GENERATE', 20),
     global: int('RATE_LIMIT_GLOBAL', 600),
   },
+  // Hops of reverse proxy in front of the server. 0 (the default) means
+  // X-Forwarded-For is ignored, so a client cannot choose its own IP.
+  trustProxyHops: int('TRUST_PROXY_HOPS', 0),
+  // How long a participant may have no open socket before the host sees them
+  // as disconnected. Covers a page reload or a quick wifi blip.
+  presenceGraceMs: int('PRESENCE_GRACE_MS', 5_000),
+  wsMaxPayloadBytes: int('WS_MAX_PAYLOAD_BYTES', 64 * 1024),
   ai: {
     provider: (process.env.AI_PROVIDER || process.env.AI || 'mock').toLowerCase(),
     apiKey: process.env.ANTHROPIC_API_KEY || '',
@@ -60,6 +70,7 @@ export const config = {
   },
   answerGraceMs: int('ANSWER_GRACE_MS', 750),
   autoRevealTickMs: int('AUTO_REVEAL_TICK_MS', 500),
+  autoAdvanceSeconds: int('AUTO_ADVANCE_SECONDS', 5),
   answerCoalesceMs: int('ANSWER_COALESCE_MS', 250),
   heartbeatMs: int('HEARTBEAT_MS', 30_000),
   logLevel: process.env.LOG_LEVEL || (process.env.NODE_ENV === 'test' ? 'error' : 'info'),

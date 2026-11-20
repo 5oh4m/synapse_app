@@ -20,6 +20,8 @@ version: 1.0.0+1
 
 environment:
   sdk: ^3.11.0
+  # Pinned per docs/TOOLCHAIN.md: onReorderItem and the tests need 3.47.
+  flutter: ">=3.47.0"
 
 # Dependencies specify other packages that your package needs in order to work.
 # To automatically upgrade your package dependencies to the latest versions
@@ -29,6 +31,9 @@ environment:
 # versions available, run `flutter pub outdated`.
 dependencies:
   flutter:
+    sdk: flutter
+  # usePathUrlStrategy(): real /join/ABC123 URLs instead of /#/join/ABC123.
+  flutter_web_plugins:
     sdk: flutter
 
   # The following adds the Cupertino Icons font to your application.
@@ -45,6 +50,13 @@ dependencies:
   collection: ^1.19.1
   shared_preferences: ^2.5.5
   web_socket_channel: ^3.0.3
+  # Access/refresh tokens: Keychain/Keystore/libsecret on mobile+desktop.
+  # There is no real secure backing on web, so the web fallback is
+  # shared_preferences — see lib/data/local/token_store.dart.
+  flutter_secure_storage: ^11.1.0
+  crypto: ^3.0.6
+  # The lobby's join QR code, so thirty phones do not have to type a code.
+  qr_flutter: ^4.1.0
 
 dev_dependencies:
   flutter_test:

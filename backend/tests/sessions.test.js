@@ -87,6 +87,73 @@ describe('the answer key never leaves the server early', () => {
   });
 });
 
+describe('nothing about a question reaches a student before the class does (second audit)', () => {
+  test('a student cannot read any question from the lobby', async () => {
+    const { educator, student, session } = await stage({ questionCount: 3 });
+    for (const index of [0, 2]) {
+      const res = await student.get(`/api/sessions/${session.id}/current-question?index=${index}`);
+      assert.equal(res.status, 404, `lobby leaked question ${index}`);
+      assert.ok(!JSON.stringify(res.body).includes('Question number'));
+    }
+    const host = await educator.get(`/api/sessions/${session.id}/current-question?index=2`);
+    assert.equal(host.status, 200, 'the host may preview any question');
+  });
+
+  test('a student cannot read ahead of the current question', async () => {
+    const { educator, student, session } = await stage({ questionCount: 3 });
+    await educator.post(`/api/sessions/${session.id}/start`).send({});
+    const ahead = await student.get(`/api/sessions/${session.id}/current-question?index=1`);
+    assert.equal(ahead.status, 404);
+    const now = await student.get(`/api/sessions/${session.id}/current-question?index=0`);
+    assert.equal(now.status, 200);
+    assert.equal(now.body.question.correct_index, -1);
+  });
+
+  test('the answer response withholds correctness until reveal, then includes it', async () => {
+    const { educator, student, session } = await stage();
+    await educator.post(`/api/sessions/${session.id}/start`).send({});
+
+    const asking = await student
+      .post(`/api/sessions/${session.id}/answer`)
+      .send({ question_index: 0, selected_index: 0 });
+    assert.equal(asking.status, 201);
+    assert.equal(asking.body.revealed, false);
+    assert.equal(asking.body.is_correct, undefined, 'correctness leaked before reveal');
+    assert.equal(asking.body.points_awarded, undefined, 'points leaked before reveal');
+
+    await educator.post(`/api/sessions/${session.id}/reveal`).send({});
+    const after = await student
+      .post(`/api/sessions/${session.id}/answer`)
+      .send({ question_index: 0, selected_index: 0 });
+    assert.equal(after.status, 200);
+    assert.equal(after.body.revealed, true);
+    assert.equal(after.body.is_correct, true);
+    assert.ok(after.body.points_awarded > 0);
+
+    const current = await student.get(`/api/sessions/${session.id}/current-question`);
+    assert.equal(current.body.my_response.is_correct, true);
+    assert.equal(current.body.my_response.selected_index, 0);
+  });
+
+  test('results mid-quiz list only revealed questions, with no key for the rest', async () => {
+    const { educator, student, session } = await stage({ questionCount: 3 });
+    await educator.post(`/api/sessions/${session.id}/start`).send({});
+
+    const early = await student.get(`/api/sessions/${session.id}/results`);
+    assert.equal(early.status, 200);
+    assert.deepEqual(early.body.my_breakdown, [], 'results served the key before any reveal');
+
+    await educator.post(`/api/sessions/${session.id}/reveal`).send({});
+    const one = await student.get(`/api/sessions/${session.id}/results`);
+    assert.equal(one.body.my_breakdown.length, 1);
+    assert.equal(one.body.my_breakdown[0].question_index, 0);
+
+    await educator.post(`/api/sessions/${session.id}/end`).send({});
+    const all = await student.get(`/api/sessions/${session.id}/results`);
+    assert.equal(all.body.my_breakdown.length, 3);
+  });
+});
+
 describe('host-only session controls', () => {
   for (const action of ['start', 'reveal', 'next', 'end']) {
     test(`a participant cannot POST /sessions/:id/${action}`, async () => {
@@ -154,14 +221,6 @@ describe('server-authoritative timing (the cheat the audit found)', () => {
       .send({ question_index: 0, selected_index: 0, response_time_ms: 1 });
 
     assert.equal(res.status, 201);
-    assert.equal(res.body.is_correct, true);
-
-    // base 500 + round(500 * (1 - 10/20)) = 750. A trusted "1 ms" would be 1000.
-    assert.ok(
-      res.body.points_awarded >= 730 && res.body.points_awarded <= 770,
-      `expected ~750 from server timing, got ${res.body.points_awarded}`,
-    );
-    assert.notEqual(res.body.points_awarded, 1000, 'the client clock was trusted');
     assert.ok(
       res.body.response_time_ms >= 9_000,
       `response_time_ms should be the server's ~10000, got ${res.body.response_time_ms}`,
@@ -169,10 +228,17 @@ describe('server-authoritative timing (the cheat the audit found)', () => {
     assert.ok(res.body.ignored_fields.includes('response_time_ms'));
 
     const { rows } = await query(
-      'SELECT response_time_ms, points_awarded FROM responses WHERE session_id = $1',
+      'SELECT response_time_ms, points_awarded, is_correct FROM responses WHERE session_id = $1',
       [session.id],
     );
+    assert.equal(rows[0].is_correct, true);
     assert.ok(rows[0].response_time_ms >= 9_000, 'the forged 1 ms was persisted');
+    // base 500 + round(500 * (1 - 10/20)) = 750. A trusted "1 ms" would be 1000.
+    assert.ok(
+      rows[0].points_awarded >= 730 && rows[0].points_awarded <= 770,
+      `expected ~750 from server timing, got ${rows[0].points_awarded}`,
+    );
+    assert.notEqual(rows[0].points_awarded, 1000, 'the client clock was trusted');
   });
 
   test('an honest fast answer still earns the full bonus, so timing is real not capped', async () => {
@@ -183,7 +249,10 @@ describe('server-authoritative timing (the cheat the audit found)', () => {
       .post(`/api/sessions/${session.id}/answer`)
       .send({ question_index: 0, selected_index: 0 });
     assert.equal(res.status, 201);
-    assert.ok(res.body.points_awarded > 950, `a genuinely instant answer should be ~1000, got ${res.body.points_awarded}`);
+    const { rows } = await query('SELECT points_awarded FROM responses WHERE session_id = $1', [
+      session.id,
+    ]);
+    assert.ok(rows[0].points_awarded > 950, `a genuinely instant answer should be ~1000, got ${rows[0].points_awarded}`);
   });
 
   test('a forged tiny time cannot rescue a late answer', async () => {
@@ -211,8 +280,13 @@ describe('server-authoritative timing (the cheat the audit found)', () => {
     const res = await student
       .post(`/api/sessions/${session.id}/answer`)
       .send({ question_index: 0, selected_index: 2, response_time_ms: 1 });
-    assert.equal(res.body.is_correct, false);
-    assert.equal(res.body.points_awarded, 0);
+    assert.equal(res.status, 201);
+    const { rows } = await query(
+      'SELECT is_correct, points_awarded FROM responses WHERE session_id = $1',
+      [session.id],
+    );
+    assert.equal(rows[0].is_correct, false);
+    assert.equal(rows[0].points_awarded, 0);
   });
 });
 
@@ -323,11 +397,10 @@ describe('double submit cannot rescore', () => {
     assert.equal(second.status, 200, 'a resubmit must be 200, not a new 201');
     assert.equal(second.body.scored, false);
     assert.equal(second.body.id, first.body.id, 'a second row was created');
-    assert.equal(second.body.points_awarded, first.body.points_awarded, 'the answer was rescored');
     assert.equal(second.body.selected_index, first.body.selected_index);
 
     const { rows } = await query(
-      'SELECT count(*)::int AS n FROM responses WHERE session_id = $1 AND question_index = 0',
+      'SELECT count(*)::int AS n, max(points_awarded)::int AS points FROM responses WHERE session_id = $1 AND question_index = 0',
       [session.id],
     );
     assert.equal(rows[0].n, 1, 'two rows exist for one (participant, question)');
@@ -337,7 +410,7 @@ describe('double submit cannot rescore', () => {
       [session.id],
     );
     assert.equal(p.rows[0].answered_count, 1, 'answered_count was double counted');
-    assert.equal(p.rows[0].total_score, first.body.points_awarded, 'the score was added twice');
+    assert.equal(p.rows[0].total_score, rows[0].points, 'the score was added twice');
   });
 
   test('two concurrent submits produce exactly one scored row', async () => {

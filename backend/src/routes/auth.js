@@ -1,12 +1,12 @@
 import { Router } from 'express';
 import * as auth from '../services/auth.service.js';
 import { requireAuth } from '../middleware/auth.js';
-import { authLimiter } from '../middleware/rate-limit.js';
+import { authLimiter, authIpLimiter } from '../middleware/rate-limit.js';
 import { email, password, str, oneOf, rejectIdentityFields } from '../util/validate.js';
 
 export const authRoutes = Router();
 
-authRoutes.post('/register', authLimiter, async (req, res) => {
+authRoutes.post('/register', authIpLimiter, authLimiter, async (req, res) => {
   rejectIdentityFields(req.body);
   const payload = {
     name: str(req.body, 'name', { required: true, max: 80 }),
@@ -18,7 +18,7 @@ authRoutes.post('/register', authLimiter, async (req, res) => {
   res.status(201).json(out);
 });
 
-authRoutes.post('/login', authLimiter, async (req, res) => {
+authRoutes.post('/login', authIpLimiter, authLimiter, async (req, res) => {
   const out = await auth.login({
     email: email(req.body),
     // Not `password()`: an existing short password must still be able to sign

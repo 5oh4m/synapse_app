@@ -4,43 +4,74 @@
 ///   flutter run --dart-define-from-file=dart_define.json
 /// or individual --dart-define=KEY=VALUE flags.
 ///
-/// Nothing secret is committed. See dart_define.example.json and README.
+/// Nothing secret is read here. A `--dart-define` is a *compile-time constant*:
+/// it is baked into `main.dart.js` in plain text and is trivially recoverable
+/// from a shipped build, so no API key is ever accepted from this class. The
+/// Anthropic key lives only in `backend/.env`; the client asks the backend to
+/// generate (`POST /generate`).
 class Env {
   const Env._();
 
-  /// `memory` (default, zero-setup, single-device) or `remote` (talks to the
-  /// bundled Node backend so live sessions work across real devices).
+  /// `memory` (offline, single-device, zero setup) or `remote` (the JWT +
+  /// Postgres backend in `backend/`, required for real multi-device play).
   static const String backend = String.fromEnvironment(
     'BACKEND',
     defaultValue: 'memory',
   );
 
-  /// Base URL of the Node backend when [backend] == 'remote'.
+  /// Origin of the backend when [backend] == 'remote'. The REST API is served
+  /// under `<apiBase>/api`; the socket is `<apiBase>/ws`.
   static const String apiBase = String.fromEnvironment(
     'API_BASE',
     defaultValue: 'http://localhost:8787',
   );
 
-  /// `mock` (default, offline, deterministic-ish) or `anthropic`
-  /// (real Claude call; only honoured by the Node backend / dev client).
+  /// REST root. Every call in [ApiClient] is relative to this.
+  static String get apiRoot => '${_trimSlash(apiBase)}/api';
+
+  /// `ws://…/ws` / `wss://…/ws`, derived from [apiBase].
+  static Uri wsUri(String accessToken) {
+    final base = Uri.parse(_trimSlash(apiBase));
+    return base.replace(
+      scheme: base.scheme == 'https' ? 'wss' : 'ws',
+      path: '${base.path}/ws',
+      queryParameters: {'token': accessToken},
+    );
+  }
+
+  /// Label only. The provider that actually runs is chosen by the *server*
+  /// from `AI_PROVIDER` in `backend/.env`; the client cannot pick it.
   static const String aiProvider = String.fromEnvironment(
     'AI',
     defaultValue: 'mock',
   );
 
-  /// Dev-only: lets the Flutter client call Claude directly. Never ship a real
-  /// key in a client build — production routes generation through the backend.
-  static const String anthropicApiKey = String.fromEnvironment(
-    'ANTHROPIC_API_KEY',
-    defaultValue: '',
-  );
-
+  /// Shown in the "how are questions generated" banner. The backend pins the
+  /// real id (`claude-sonnet-4-20250514`); `claude-sonnet-5` does not exist.
   static const String anthropicModel = String.fromEnvironment(
     'ANTHROPIC_MODEL',
-    defaultValue: 'claude-sonnet-5',
+    defaultValue: 'claude-sonnet-4-20250514',
   );
 
   static bool get isRemote => backend == 'remote';
-  static bool get useAnthropicDirect =>
-      aiProvider == 'anthropic' && anthropicApiKey.isNotEmpty;
+
+  /// Public origin of this app, for join links and QR codes. Optional on web,
+  /// where the page's own origin is used; set it for native builds, or when
+  /// the app is served from a different host than the one students should
+  /// open.
+  static const String appUrl = String.fromEnvironment('APP_URL');
+
+  /// `https://…/join/ABC123` — the link a student opens (or scans) to land on
+  /// the join screen with the code filled in. Null when no public origin is
+  /// known (a native build without `APP_URL`).
+  static String? joinUrl(String code) {
+    final origin = appUrl.isNotEmpty
+        ? _trimSlash(appUrl)
+        : (Uri.base.scheme.startsWith('http') ? Uri.base.origin : null);
+    if (origin == null) return null;
+    return '$origin/join/$code';
+  }
+
+  static String _trimSlash(String s) =>
+      s.endsWith('/') ? s.substring(0, s.length - 1) : s;
 }

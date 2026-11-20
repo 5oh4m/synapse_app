@@ -74,9 +74,11 @@ class QuestionReviewScreen extends ConsumerWidget {
                         : ReorderableListView.builder(
                             padding: const EdgeInsets.only(bottom: 90),
                             itemCount: list.length,
-                            onReorder: (from, to) {
+                            // onReorderItem hands over the index *after*
+                            // removal, so no off-by-one adjustment here.
+                            // Needs Flutter 3.47 (see docs/TOOLCHAIN.md).
+                            onReorderItem: (from, to) {
                               final ids = list.map((e) => e.id).toList();
-                              if (to > from) to -= 1;
                               final id = ids.removeAt(from);
                               ids.insert(to, id);
                               ref

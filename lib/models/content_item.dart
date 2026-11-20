@@ -65,6 +65,24 @@ class ContentItem {
     'created_at': createdAt.toIso8601String(),
   };
 
+  /// Maps the server's `processing|ready|needs_text|failed` onto
+  /// [ContentStatus].
+  ///
+  /// `needs_text` becomes [ContentStatus.failed] with the server's message kept
+  /// in [error] — "no OCR is bundled, paste the text" — because extraction
+  /// genuinely did not produce text. It must never map to `ready`, which is
+  /// what a plain `enumFromName` fallback did: an image with no text at all
+  /// showed up as "Ready for review".
+  static ContentStatus statusFromWire(String? raw) => switch (raw) {
+    'ready' => ContentStatus.ready,
+    'processing' => ContentStatus.extracting,
+    'extracting' => ContentStatus.extracting,
+    'uploading' => ContentStatus.uploading,
+    'generating' => ContentStatus.generating,
+    'needs_text' => ContentStatus.failed,
+    _ => ContentStatus.failed,
+  };
+
   factory ContentItem.fromJson(Map<String, dynamic> j) => ContentItem(
     id: j['id'] as String,
     ownerId: j['owner_id'] as String,
@@ -75,11 +93,7 @@ class ContentItem {
       j['file_type'] as String?,
       ContentType.text,
     ),
-    status: enumFromName(
-      ContentStatus.values,
-      j['status'] as String?,
-      ContentStatus.ready,
-    ),
+    status: statusFromWire(j['status'] as String?),
     fileUrl: j['file_url'] as String?,
     extractedText: (j['extracted_text'] ?? '') as String,
     pageCount: (j['page_count'] ?? 0) as int,
